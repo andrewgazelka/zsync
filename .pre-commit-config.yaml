@@ -21,8 +21,8 @@ repos:
 
       # Level 2: Depends on clippy
       - id: cargo-test
-        name: cargo nextest
-        entry: cargo nextest run --all-features
+        name: cargo test
+        entry: cargo test --all-features
         language: system
         files: \.rs$
         pass_filenames: false
