@@ -1,0 +1,33 @@
+cognitive-complexity-threshold = 100
+excessive-nesting-threshold = 5
+msrv = "1.91.0"
+single-char-binding-names-threshold = 1
+too-many-lines-threshold = 100
+
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+cargo-ignore-publish = true
+
+disallowed-methods = [
+    # Memory management
+    { path = "std::vec::Vec::leak", reason = "no leaking memory" },
+    { path = "std::mem::forget", reason = "no leaking memory" },
+    { path = "std::boxed::Box::leak", reason = "no leaking memory" },
+
+    # Panic-inducing functions
+    { path = "std::panic::panic_any", reason = "use eyre::Result for error handling" },
+
+    # Process operations
+    { path = "std::process::exit", reason = "prefer graceful shutdown patterns" },
+    { path = "std::process::abort", reason = "prefer graceful error handling" },
+]
+
+doc-valid-idents = [
+    "GitHub",
+    "GitLab",
+    "OAuth",
+    "OpenSSH",
+    "WebSocket",
+    "macOS",
+    "PostgreSQL",
+]

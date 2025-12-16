@@ -1,0 +1,25 @@
+[package]
+name = "zsync-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core sync engine for zsync"
+
+[dependencies]
+color-eyre.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ignore.workspace = true
+blake3.workspace = true
+crc32fast.workspace = true
+zstd.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

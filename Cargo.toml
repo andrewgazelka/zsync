@@ -1,0 +1,123 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/andrewgazelka/zsync"
+
+[workspace.dependencies]
+# Error handling & logging
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# File scanning & ignore
+ignore = "0.4"
+walkdir = "2"
+
+# Hashing
+blake3 = "1"
+crc32fast = "1"
+
+# Compression
+zstd = "0.13"
+
+# SSH
+russh = "0.50"
+russh-keys = "0.50"
+
+# File watching
+notify = { version = "8", features = ["serde"] }
+notify-debouncer-full = "0.5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Misc
+bytes = { version = "1", features = ["serde"] }
+tempfile = "3"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+
+# Internal crates
+zsync-core = { path = "crates/core" }
+zsync-agent = { path = "crates/agent" }
+zsync-transport = { path = "crates/transport" }
+
+[workspace.lints.clippy]
+# Deny all categories
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+
+# Allow casts (common in systems code)
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+# Allow specific lints - Code style
+collapsible_if = "allow"
+doc_lazy_continuation = "allow"
+doc_markdown = "allow"
+many_single_char_names = "allow"
+match_same_arms = "allow"
+single_match_else = "allow"
+uninlined_format_args = "deny"
+
+# Allow specific lints - Documentation
+missing_const_for_fn = "allow"
+missing_docs_in_private_items = "allow"
+missing_errors_doc = "allow"
+
+# Allow specific lints - Design patterns
+future_not_send = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+option_if_let_else = "allow"
+significant_drop_tightening = "allow"
+struct_excessive_bools = "allow"
+
+# Allow specific lints - Miscellaneous
+multiple_crate_versions = "allow"
+similar_names = "allow"
+
+# Allow - Performance tradeoffs
+large_stack_arrays = "allow"
+
+# Deny specific lints - Safety
+char_indices_as_byte_indices = "deny"
+indexing_slicing = "allow"  # Too restrictive for slice operations
+string_slice = "allow"  # Too restrictive, we handle ASCII strings
+
+# Deny specific lints - Code quality
+cognitive_complexity = "deny"
+excessive_nesting = "allow"  # Delta algorithm is inherently nested
+missing_panics_doc = "allow"  # TODO: add proper docs later
+print_stdout = "deny"
+print_stderr = "allow"  # Agent uses stderr for logging
+
+[workspace.lints.rust]
+# Deny categories
+deprecated_safe = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+# Warn
+unsafe_code = "warn"
