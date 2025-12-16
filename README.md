@@ -17,16 +17,16 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 | Remote dependencies | rsync required | Auto-deploy (~50MB Go) | Auto-deploy (~3MB Rust) |
 | Respects .gitignore | ❌ Manual exclude | ⚠️ Works but ignores global | ✅ **Automatic** |
 | Watch mode | ❌ External tools | ✅ Built-in | ✅ Built-in |
-| Delta sync | ✅ | ✅ | ✅ |
+| Intra-file delta sync | ✅ Fixed blocks | ❌ Whole files | ✅ **FastCDC** |
 
 ## Features
 
 - **Zero remote dependencies** — Agent auto-deploys via SSH (Linux x86_64/aarch64)
 - **Native .gitignore** — Respects your existing ignore files automatically
-- **Delta sync** — Only transfers what changed (rsync algorithm)
+- **FastCDC delta sync** — Content-defined chunking transfers only changed bytes, not whole files
 - **Watch mode** — Continuous sync with debouncing
 - **Static binaries** — Works on any Linux server, no glibc version issues
-- **Fast** — BLAKE3 hashing, zstd compression, pipelined transfers
+- **Fast** — BLAKE3 hashing, zstd compression, heed (LMDB) signature caching
 
 ## Quick Start
 
@@ -66,8 +66,14 @@ sequenceDiagram
     Local->>Remote: Request snapshot
     Remote-->>Local: File hashes (BLAKE3)
     Local->>Local: Compute diff
-    Local->>Remote: Send changed files (zstd compressed)
-    Remote->>Remote: Write files atomically
+
+    Note over Local,Remote: For modified files — intra-file delta sync
+
+    Local->>Remote: Request chunk signature
+    Remote-->>Local: FastCDC chunks (from cache or computed)
+    Local->>Local: Match chunks, generate delta
+    Local->>Remote: Send delta (only changed bytes, zstd compressed)
+    Remote->>Remote: Apply delta atomically
 ```
 
 **The key insight:** zsync embeds pre-compiled static agents for Linux x86_64 and aarch64. When you connect, it detects the remote platform, uploads the ~3MB agent binary, and runs it. The agent handles all file operations on the remote side.
