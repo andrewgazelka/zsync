@@ -34,14 +34,34 @@ pub struct Scanner {
     includes: Vec<String>,
 }
 
+/// Filename for include patterns (like .gitignore but for force-including)
+pub const ZSYNC_INCLUDE_FILE: &str = ".zsyncinclude";
+
 impl Scanner {
     /// Create a new scanner for the given root directory
+    ///
+    /// Automatically loads patterns from `.zsyncinclude` if present.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let mut includes = Vec::new();
+
+        // Load .zsyncinclude if it exists
+        let include_path = root.join(ZSYNC_INCLUDE_FILE);
+        if let Ok(contents) = std::fs::read_to_string(&include_path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                // Skip empty lines and comments
+                if !line.is_empty() && !line.starts_with('#') {
+                    includes.push(line.to_string());
+                }
+            }
+        }
+
         Self {
-            root: root.into(),
+            root,
             extra_ignores: Vec::new(),
-            includes: Vec::new(),
+            includes,
         }
     }
 
@@ -314,6 +334,42 @@ mod tests {
         assert!(
             paths.contains(&PathBuf::from(".env")),
             ".env should be included: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("keep.txt")),
+            "keep.txt should still be present: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_zsyncinclude_file() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), ".env\nsecrets/\n").unwrap();
+        fs::write(dir.path().join(".env"), "SECRET=123").unwrap();
+        fs::create_dir(dir.path().join("secrets")).unwrap();
+        fs::write(dir.path().join("secrets/key.pem"), "private").unwrap();
+        fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+
+        // Create .zsyncinclude file
+        fs::write(
+            dir.path().join(".zsyncinclude"),
+            "# Force include these files\n.env\nsecrets/key.pem\n",
+        )
+        .unwrap();
+
+        // Scanner should auto-load .zsyncinclude
+        let scanner = Scanner::new(dir.path());
+        let entries = scanner.scan().unwrap();
+        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
+
+        assert!(
+            paths.contains(&PathBuf::from(".env")),
+            ".env should be included via .zsyncinclude: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("secrets/key.pem")),
+            "secrets/key.pem should be included via .zsyncinclude: {paths:?}"
         );
         assert!(
             paths.contains(&PathBuf::from("keep.txt")),
