@@ -17,8 +17,8 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 | Remote dependencies | rsync required | Auto-deploy (~50MB Go) | Auto-deploy (~3MB Rust) |
 | Respects .gitignore | ❌ Manual exclude | ⚠️ Works but ignores global | ✅ **Automatic** |
 | Watch mode | ❌ External tools | ✅ Built-in | ✅ Built-in |
-| Deduplication | Per-file delta | ❌ Whole files | ✅ **Cross-file CAS** |
-| Intra-file delta | ✅ Fixed blocks | ❌ No | ✅ **FastCDC chunks** |
+| Cross-file dedup | ❌ Per-file only | ❌ Per-session only | ✅ **Persistent CAS** |
+| Intra-file delta | ✅ Fixed 8KB blocks | ✅ Fixed 8KB blocks | ✅ **FastCDC (adaptive)** |
 
 ## Features
 
