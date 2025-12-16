@@ -19,7 +19,7 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 | Remote setup | Manual install | Auto-deploy | **Auto-deploy** |
 | Respects .gitignore | ❌ Manual flags | ⚠️ Ignores global | ✅ **Full support** |
 | Watch mode | ❌ External tools | ✅ Built-in | ✅ Built-in |
-| Chunking | Fixed 8KB blocks | Fixed 8KB blocks | **FastCDC (adaptive)** |
+| Chunk boundaries | Fixed offsets | Fixed offsets | **Content-aware** |
 
 ## Features
 
