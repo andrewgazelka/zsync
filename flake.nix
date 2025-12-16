@@ -26,10 +26,11 @@
         overlays = [rust-overlay.overlays.default];
       };
 
-    # Rust toolchain (same for all systems)
+    # Rust toolchain with musl targets for cross-compilation
     rustToolchainFor = pkgs:
       pkgs.rust-bin.stable.latest.default.override {
         extensions = ["rust-src" "rust-analyzer"];
+        targets = ["x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl"];
       };
 
     # Crane lib for a system
@@ -40,16 +41,13 @@
 
     # Common build args for a system
     commonArgsFor = system: let
-      pkgs = pkgsFor system;
       craneLib = craneLibFor system;
     in {
       src = craneLib.cleanCargoSource ./.;
       strictDeps = true;
-      # Darwin frameworks (Security, CoreFoundation, CoreServices) are now
-      # automatically included in the Darwin stdenv on nixpkgs-unstable
     };
 
-    # Build zsync-agent for a system (native build, no embedded agents)
+    # Build zsync-agent for a system (native build)
     agentFor = system: let
       craneLib = craneLibFor system;
       commonArgs = commonArgsFor system;
@@ -61,7 +59,69 @@
           cargoExtraArgs = "-p zsync-agent";
         });
 
-    # Build zsync CLI (without embedded agents - for local dev/testing)
+    # Cross-compile zsync-agent for Linux (static musl) from any host
+    crossAgentFor = hostSystem: targetArch: let
+      hostPkgs = pkgsFor hostSystem;
+
+      # Use musl cross toolchain
+      crossPkgs =
+        if targetArch == "x86_64"
+        then hostPkgs.pkgsCross.musl64
+        else hostPkgs.pkgsCross.aarch64-multiplatform-musl;
+
+      cargoTarget =
+        if targetArch == "x86_64"
+        then "x86_64-unknown-linux-musl"
+        else "aarch64-unknown-linux-musl";
+
+      # Create crane lib with cross toolchain
+      craneLib = (crane.mkLib crossPkgs).overrideToolchain (rustToolchainFor hostPkgs);
+
+      commonArgs = {
+        src = craneLib.cleanCargoSource ./.;
+        strictDeps = true;
+
+        CARGO_BUILD_TARGET = cargoTarget;
+        CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+
+        # Use the cross compiler
+        "CARGO_TARGET_${hostPkgs.lib.toUpper (builtins.replaceStrings ["-"] ["_"] cargoTarget)}_LINKER" =
+          "${crossPkgs.stdenv.cc}/bin/${crossPkgs.stdenv.cc.targetPrefix}cc";
+
+        HOST_CC = "${hostPkgs.stdenv.cc}/bin/cc";
+
+        depsBuildBuild = [hostPkgs.stdenv.cc];
+        nativeBuildInputs = [crossPkgs.stdenv.cc];
+      };
+
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+    in
+      craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "-p zsync-agent";
+        });
+
+    # Build zsync CLI with embedded Linux agents (cross-compiled static musl)
+    zsyncWithAgentsFor = system: let
+      pkgs = pkgsFor system;
+      craneLib = craneLibFor system;
+      commonArgs = commonArgsFor system;
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+      # Cross-compile Linux agents
+      linuxAgentX86 = crossAgentFor system "x86_64";
+      linuxAgentArm = crossAgentFor system "aarch64";
+    in
+      craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "-p zsync";
+          ZSYNC_AGENT_LINUX_X86_64 = "${linuxAgentX86}/bin/zsync-agent";
+          ZSYNC_AGENT_LINUX_AARCH64 = "${linuxAgentArm}/bin/zsync-agent";
+        });
+
+    # Build zsync CLI without embedded agents (for quick local builds)
     zsyncFor = system: let
       craneLib = craneLibFor system;
       commonArgs = commonArgsFor system;
@@ -72,33 +132,17 @@
           inherit cargoArtifacts;
           cargoExtraArgs = "-p zsync";
         });
-
-    # Variant with embedded agents (requires Linux agents available)
-    zsyncWithAgentsFor = system: let
-      pkgs = pkgsFor system;
-      craneLib = craneLibFor system;
-      commonArgs = commonArgsFor system;
-      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-    in
-      craneLib.buildPackage (commonArgs
-        // {
-          inherit cargoArtifacts;
-          cargoExtraArgs = "-p zsync";
-          ZSYNC_AGENT_LINUX_X86_64 = "${self.packages.x86_64-linux.zsync-agent}/bin/zsync-agent";
-          ZSYNC_AGENT_LINUX_AARCH64 = "${self.packages.aarch64-linux.zsync-agent}/bin/zsync-agent";
-        });
   in {
     packages = forAllSystems (system: let
       pkgs = pkgsFor system;
     in
       {
-        default = zsyncFor system;
-        zsync = zsyncFor system;
+        # Default includes embedded agents (cross-compiled)
+        default = zsyncWithAgentsFor system;
+        zsync = zsyncWithAgentsFor system;
         zsync-agent = agentFor system;
-      }
-      // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
-        # Only expose zsync-with-agents on Darwin
-        zsync-with-agents = zsyncWithAgentsFor system;
+        # Quick build without agents
+        zsync-lite = zsyncFor system;
       });
 
     devShells = forAllSystems (system: let
@@ -119,7 +163,6 @@
       commonArgs = commonArgsFor system;
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
     in {
-      zsync = self.packages.${system}.zsync;
       zsync-agent = self.packages.${system}.zsync-agent;
       clippy = craneLib.cargoClippy (commonArgs
         // {

@@ -10,11 +10,16 @@
       .subtitle { fill: #8b949e; }
     }
 
-    @keyframes sync {
+    @keyframes sync1 {
       0%, 100% { transform: translateX(0); opacity: 1; }
       50% { transform: translateX(8px); opacity: 0.6; }
     }
-    .arrow-animated { animation: sync 1.5s ease-in-out infinite; }
+    @keyframes sync2 {
+      0%, 100% { transform: translateX(0); opacity: 1; }
+      50% { transform: translateX(-8px); opacity: 0.6; }
+    }
+    .arrow1 { animation: sync1 1.5s ease-in-out infinite; }
+    .arrow2 { animation: sync2 1.5s ease-in-out 0.3s infinite; }
   </style>
 
   <!-- Sync icon: two folders with arrows -->
@@ -28,10 +33,10 @@
     </g>
 
     <!-- Sync arrows -->
-    <g class="arrow-animated" transform="translate(58, 20)">
+    <g class="arrow1" transform="translate(58, 20)">
       <path class="arrow" d="M0 12 L20 12 M14 6 L20 12 L14 18"/>
     </g>
-    <g class="arrow-animated" transform="translate(58, 38)" style="animation-delay: 0.3s;">
+    <g class="arrow2" transform="translate(58, 38)">
       <path class="arrow" d="M20 12 L0 12 M6 6 L0 12 L6 18"/>
     </g>
 
