@@ -11,7 +11,6 @@ tracing.workspace = true
 tokio.workspace = true
 dirs.workspace = true
 russh.workspace = true
-ssh2-config = "0.6"
 
 zsync-core = { path = "../core" }
 

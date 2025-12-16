@@ -200,6 +200,46 @@ impl AgentSession {
     }
 }
 
+/// Simple glob matching for SSH host patterns
+/// Supports * as wildcard (matches any characters)
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let mut pattern_chars = pattern.chars().peekable();
+    let mut text_chars = text.chars().peekable();
+
+    while let Some(p) = pattern_chars.next() {
+        match p {
+            '*' => {
+                // If * is at end, match everything
+                if pattern_chars.peek().is_none() {
+                    return true;
+                }
+                // Try matching rest of pattern at each position
+                let rest: String = pattern_chars.collect();
+                let remaining: String = text_chars.collect();
+                for i in 0..=remaining.len() {
+                    if glob_match(&rest, &remaining[i..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            '?' => {
+                // Match any single character
+                if text_chars.next().is_none() {
+                    return false;
+                }
+            }
+            c => {
+                if text_chars.next() != Some(c) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    text_chars.next().is_none()
+}
+
 /// Decode snapshot from binary (same format as protocol.rs)
 fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
     use std::io::{Cursor, Read};
@@ -251,13 +291,9 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
     Ok(Snapshot::from_entries(entries))
 }
 
-/// Parsed SSH config for a specific host
+/// Parsed SSH config for a specific host (naive parser)
 struct SshHostConfig {
     identity_agent: Option<PathBuf>,
-    identity_files: Vec<PathBuf>,
-    port: Option<u16>,
-    user: Option<String>,
-    host_name: Option<String>,
 }
 
 impl SshTransport {
@@ -292,17 +328,22 @@ impl SshTransport {
         })
     }
 
-    /// Parse SSH config for a specific host using ssh2-config
+    /// Parse SSH config for IdentityAgent (naive line-by-line parser)
+    ///
+    /// This is a simple parser that looks for `IdentityAgent` in ~/.ssh/config.
+    /// It handles:
+    /// - Global settings (Host *)
+    /// - Host-specific settings
+    /// - Paths with spaces (common with 1Password)
+    /// - Tilde expansion
     fn parse_ssh_config(host: &str) -> SshHostConfig {
+        use std::io::BufRead;
+
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => {
                 return SshHostConfig {
                     identity_agent: None,
-                    identity_files: Vec::new(),
-                    port: None,
-                    user: None,
-                    host_name: None,
                 };
             }
         };
@@ -313,68 +354,68 @@ impl SshTransport {
             Err(_) => {
                 return SshHostConfig {
                     identity_agent: None,
-                    identity_files: Vec::new(),
-                    port: None,
-                    user: None,
-                    host_name: None,
                 };
             }
         };
 
-        let mut reader = std::io::BufReader::new(file);
-        let config = match ssh2_config::SshConfig::default().parse(
-            &mut reader,
-            ssh2_config::ParseRule::ALLOW_UNSUPPORTED_FIELDS,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("Failed to parse SSH config: {e}");
-                return SshHostConfig {
-                    identity_agent: None,
-                    identity_files: Vec::new(),
-                    port: None,
-                    user: None,
-                    host_name: None,
-                };
+        let reader = std::io::BufReader::new(file);
+        let mut current_hosts: Vec<String> = vec!["*".to_string()]; // Start with global
+        let mut global_identity_agent: Option<PathBuf> = None;
+        let mut host_identity_agent: Option<PathBuf> = None;
+
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
             }
-        };
 
-        let params = config.query(host);
+            // Check for Host directive
+            if let Some(hosts) = line
+                .strip_prefix("Host ")
+                .or_else(|| line.strip_prefix("Host\t"))
+            {
+                current_hosts = hosts.split_whitespace().map(String::from).collect();
+                continue;
+            }
 
-        // Get IdentityAgent from unsupported_fields (ssh2-config parses but doesn't expose it)
-        // Note: ssh2-config splits on whitespace, so paths with spaces are split into multiple values
-        // We need to join them back together
-        let identity_agent = params
-            .unsupported_fields
-            .get("identityagent")
-            .and_then(|values| {
-                // Join all values with spaces (paths with spaces get split)
-                let value = values.join(" ");
-                let value = value.trim_matches('"').trim_matches('\'');
-                let expanded = if value.starts_with("~/") {
-                    home.join(&value[2..])
+            // Check for IdentityAgent directive
+            if let Some(agent) = line
+                .strip_prefix("IdentityAgent ")
+                .or_else(|| line.strip_prefix("IdentityAgent\t"))
+            {
+                let agent = agent.trim().trim_matches('"').trim_matches('\'');
+                let expanded = if agent.starts_with("~/") {
+                    home.join(&agent[2..])
                 } else {
-                    PathBuf::from(value)
+                    PathBuf::from(agent)
                 };
+
                 if expanded.exists() {
-                    debug!(
-                        "Found IdentityAgent for host {host}: {}",
-                        expanded.display()
-                    );
-                    Some(expanded)
+                    // Check if this applies to our host
+                    let matches_host = current_hosts.iter().any(|pattern| {
+                        pattern == "*" || pattern == host || glob_match(pattern, host)
+                    });
+
+                    if matches_host {
+                        if current_hosts.contains(&"*".to_string()) {
+                            global_identity_agent = Some(expanded);
+                        } else {
+                            host_identity_agent = Some(expanded);
+                        }
+                    }
                 } else {
                     debug!("IdentityAgent path does not exist: {}", expanded.display());
-                    None
                 }
-            });
-
-        SshHostConfig {
-            identity_agent,
-            identity_files: params.identity_file.unwrap_or_default(),
-            port: params.port,
-            user: params.user,
-            host_name: params.host_name,
+            }
         }
+
+        // Host-specific takes precedence over global
+        let identity_agent = host_identity_agent.or(global_identity_agent);
+        if let Some(ref path) = identity_agent {
+            debug!("Found IdentityAgent for host {host}: {}", path.display());
+        }
+
+        SshHostConfig { identity_agent }
     }
 
     /// Get the SSH agent socket path from SSH config or environment
