@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use color_eyre::Result;
+use russh::keys::agent::client::AgentClient;
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::{load_secret_key, PublicKey};
+use russh::keys::{PublicKey, load_secret_key};
 use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info};
 
@@ -125,7 +126,8 @@ impl AgentSession {
     /// Get snapshot from remote
     pub async fn snapshot(&mut self) -> Result<Snapshot> {
         // Send snapshot request: type=0x01, len=0
-        self.send(&[protocol::msg::SNAPSHOT_REQ, 0, 0, 0, 0]).await?;
+        self.send(&[protocol::msg::SNAPSHOT_REQ, 0, 0, 0, 0])
+            .await?;
 
         match self.read_message().await? {
             Message::SnapshotResp(snapshot) => Ok(snapshot),
@@ -281,23 +283,88 @@ impl SshTransport {
         })
     }
 
+    /// Get the SSH agent socket path from SSH config or environment
+    fn get_agent_socket_path() -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+
+        // First, try to parse ~/.ssh/config for IdentityAgent
+        let ssh_config_path = home.join(".ssh/config");
+        if let Ok(content) = std::fs::read_to_string(&ssh_config_path) {
+            // Look for "IdentityAgent" directive (case-insensitive)
+            // Handles both global (Host *) and per-host settings
+            for line in content.lines() {
+                let line = line.trim();
+                if line.to_lowercase().starts_with("identityagent") {
+                    // Parse: IdentityAgent "path" or IdentityAgent 'path' or IdentityAgent path
+                    let value = line
+                        .split_once(char::is_whitespace)
+                        .map(|(_, v)| v.trim())?;
+
+                    // Remove quotes if present
+                    let value = value.trim_matches('"').trim_matches('\'');
+
+                    // Expand ~ to home directory
+                    let expanded = if value.starts_with("~/") {
+                        home.join(&value[2..])
+                    } else {
+                        PathBuf::from(value)
+                    };
+
+                    if expanded.exists() {
+                        debug!("Found IdentityAgent in SSH config: {}", expanded.display());
+                        return Some(expanded);
+                    }
+                }
+            }
+        }
+
+        // Fall back to SSH_AUTH_SOCK environment variable
+        if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+            let path = PathBuf::from(&sock);
+            if path.exists() {
+                debug!("Using SSH_AUTH_SOCK: {sock}");
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
     /// Authenticate using SSH keys
     async fn authenticate(
         session: &mut russh::client::Handle<ClientHandler>,
         user: &str,
     ) -> Result<bool> {
-        // Try SSH agent first
-        if let Ok(mut agent) = russh::keys::agent::client::AgentClient::connect_env().await {
-            let identities = agent.request_identities().await?;
-            for identity in identities {
-                if let Ok(result) = session
-                    .authenticate_publickey_with(user, identity, None, &mut agent)
-                    .await
-                {
-                    if result.success() {
-                        info!("Authenticated via SSH agent");
-                        return Ok(true);
+        // Try SSH agent first (from config or environment)
+        if let Some(agent_path) = Self::get_agent_socket_path() {
+            match AgentClient::connect_uds(&agent_path).await {
+                Ok(mut agent) => {
+                    debug!("Connected to SSH agent at {}", agent_path.display());
+                    match agent.request_identities().await {
+                        Ok(identities) => {
+                            debug!("SSH agent has {} identities", identities.len());
+                            for identity in identities {
+                                if let Ok(result) = session
+                                    .authenticate_publickey_with(user, identity, None, &mut agent)
+                                    .await
+                                {
+                                    if result.success() {
+                                        info!("Authenticated via SSH agent");
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to get identities from agent: {e}");
+                        }
                     }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to connect to SSH agent at {}: {e}",
+                        agent_path.display()
+                    );
                 }
             }
         }
@@ -315,7 +382,8 @@ impl SshTransport {
                 match load_secret_key(key_path, None) {
                     Ok(key) => {
                         let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                        if let Ok(result) = session.authenticate_publickey(user, key_with_hash).await
+                        if let Ok(result) =
+                            session.authenticate_publickey(user, key_with_hash).await
                         {
                             if result.success() {
                                 info!("Authenticated with key: {}", key_path.display());
@@ -450,9 +518,7 @@ impl SshTransport {
     /// Upload bytes to remote path via exec + stdin
     async fn upload_bytes(&self, data: &[u8], remote_path: &str) -> Result<()> {
         let mut channel = self.session.channel_open_session().await?;
-        channel
-            .exec(true, format!("cat > {remote_path}"))
-            .await?;
+        channel.exec(true, format!("cat > {remote_path}")).await?;
 
         channel.data(data).await?;
         channel.eof().await?;

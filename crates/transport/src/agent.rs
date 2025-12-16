@@ -97,7 +97,10 @@ impl OwnedAgentBundle {
         self.binaries.insert(platform, data);
     }
 
-    #[expect(clippy::disallowed_methods, reason = "intentional leak for CLI lifetime")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "intentional leak for CLI lifetime"
+    )]
     fn into_static(self) -> AgentBundle {
         let mut bundle = AgentBundle::new();
         for (platform, data) in self.binaries {

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use color_eyre::Result;
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::hash::ContentHash;

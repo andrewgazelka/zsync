@@ -58,12 +58,12 @@ struct Cli {
 enum Commands {
     /// Sync local directory to remote
     Sync {
+        /// Remote destination (user@host:/path)
+        remote: String,
+
         /// Local directory path
         #[arg(default_value = ".")]
         local: PathBuf,
-
-        /// Remote destination (user@host:/path)
-        remote: String,
 
         /// SSH port
         #[arg(short, long, default_value = "22")]
@@ -76,12 +76,12 @@ enum Commands {
 
     /// Watch and continuously sync changes
     Watch {
+        /// Remote destination (user@host:/path)
+        remote: String,
+
         /// Local directory path
         #[arg(default_value = ".")]
         local: PathBuf,
-
-        /// Remote destination (user@host:/path)
-        remote: String,
 
         /// SSH port
         #[arg(short, long, default_value = "22")]

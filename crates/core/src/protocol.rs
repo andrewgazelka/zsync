@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
 
+use crate::ContentHash;
 use crate::scan::FileEntry;
 use crate::snapshot::Snapshot;
-use crate::ContentHash;
 
 /// Message type identifiers
 pub mod msg {
@@ -76,7 +76,9 @@ fn decode_path<R: Read>(r: &mut R) -> std::io::Result<PathBuf> {
     let mut path_buf = vec![0u8; len];
     r.read_exact(&mut path_buf)?;
 
-    Ok(PathBuf::from(String::from_utf8_lossy(&path_buf).to_string()))
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&path_buf).to_string(),
+    ))
 }
 
 /// Protocol writer for sending messages
@@ -227,7 +229,9 @@ impl<R: Read> ProtocolReader<R> {
             msg::ERROR => {
                 let mut payload = vec![0u8; len as usize];
                 self.inner.read_exact(&mut payload)?;
-                Ok(Message::Error(String::from_utf8_lossy(&payload).to_string()))
+                Ok(Message::Error(
+                    String::from_utf8_lossy(&payload).to_string(),
+                ))
             }
 
             msg::SHUTDOWN => Ok(Message::Shutdown),
