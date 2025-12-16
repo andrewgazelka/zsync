@@ -37,7 +37,7 @@
     craneLibFor = system: let
       pkgs = pkgsFor system;
     in
-      (crane.mkLib pkgs).overrideToolchain (rustToolchainFor pkgs);
+      (crane.mkLib pkgs).overrideToolchain (p: rustToolchainFor p);
 
     # Common build args for a system
     commonArgsFor = system: let
@@ -74,8 +74,8 @@
         then "x86_64-unknown-linux-musl"
         else "aarch64-unknown-linux-musl";
 
-      # Create crane lib with cross toolchain
-      craneLib = (crane.mkLib crossPkgs).overrideToolchain (rustToolchainFor hostPkgs);
+      # Create crane lib with cross toolchain (use function form for spliced toolchain)
+      craneLib = (crane.mkLib crossPkgs).overrideToolchain (p: rustToolchainFor p);
 
       commonArgs = {
         src = craneLib.cleanCargoSource ./.;
