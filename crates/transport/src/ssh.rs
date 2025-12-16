@@ -401,11 +401,18 @@ impl SshTransport {
             return Ok(path.clone());
         }
 
-        let version = env!("CARGO_PKG_VERSION");
-        let remote_dir = format!(".zsync/agents/{version}");
+        // Get agent binary for this platform
+        let agent_data = bundle.get(self.platform).ok_or_else(|| {
+            color_eyre::eyre::eyre!("No agent binary for platform {:?}", self.platform)
+        })?;
+
+        // Use content hash to ensure agent is re-deployed when code changes
+        let agent_hash = zsync_core::ContentHash::from_bytes(agent_data);
+        let hash_prefix = &agent_hash.to_hex()[..12];
+        let remote_dir = format!(".zsync/agents/{hash_prefix}");
         let remote_path = format!("{remote_dir}/zsync-agent");
 
-        // Check if agent already exists
+        // Check if this exact agent version already exists
         let (stdout, _, _) = self
             .execute(&format!("test -x ~/{remote_path} && echo exists"))
             .await?;
@@ -423,11 +430,6 @@ impl SshTransport {
 
         // Create directory
         self.execute(&format!("mkdir -p ~/{remote_dir}")).await?;
-
-        // Get agent binary for this platform
-        let agent_data = bundle.get(self.platform).ok_or_else(|| {
-            color_eyre::eyre::eyre!("No agent binary for platform {:?}", self.platform)
-        })?;
 
         // Get remote home dir
         let (home, _, _) = self.execute("echo $HOME").await?;
