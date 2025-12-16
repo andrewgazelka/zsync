@@ -2,12 +2,16 @@
 //!
 //! Provides file scanning, hashing, delta computation, and sync primitives.
 
+pub mod cache;
+pub mod chunker;
 pub mod delta;
 pub mod hash;
 pub mod protocol;
 pub mod scan;
 pub mod snapshot;
 
+pub use cache::ChunkCache;
+pub use chunker::{Chunk, ChunkConfig};
 pub use delta::{Delta, DeltaComputer};
 pub use hash::ContentHash;
 pub use protocol::{Message, ProtocolReader, ProtocolWriter};

@@ -18,6 +18,9 @@ zstd.workspace = true
 bytes.workspace = true
 tokio.workspace = true
 hex.workspace = true
+fastcdc.workspace = true
+heed.workspace = true
+rkyv.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -35,6 +35,15 @@ rayon = "1"
 blake3 = "1"
 crc32fast = "1"
 
+# Content-defined chunking
+fastcdc = "3.2"
+
+# Embedded database (LMDB)
+heed = "0.22"
+
+# Zero-copy serialization (bytecheck enabled by default for validation)
+rkyv = "0.8"
+
 # Compression
 zstd = "0.13"
 

@@ -181,7 +181,8 @@ fn scan_command(path: &PathBuf) -> Result<()> {
 }
 
 /// Threshold for using delta transfers (files larger than this use delta)
-const DELTA_THRESHOLD: u64 = 32 * 1024; // 32KB
+/// Set to 512 bytes to match FastCDC min chunk size - enables delta for most code files
+const DELTA_THRESHOLD: u64 = 512;
 
 /// Prepare a file for transfer, using delta if beneficial
 async fn prepare_transfer(

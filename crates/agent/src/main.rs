@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 
-use zsync_core::{DeltaComputer, Message, ProtocolReader, ProtocolWriter, Scanner, Snapshot};
+use zsync_core::{
+    ChunkCache, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter, Scanner,
+    Snapshot,
+};
 
 #[derive(Parser)]
 #[command(name = "zsync-agent")]
@@ -54,6 +57,11 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
     // Ensure root directory exists
     std::fs::create_dir_all(root)?;
 
+    // Initialize chunk cache at {root}/.zsync/cache
+    let cache_path = root.join(".zsync").join("cache");
+    let cache = ChunkCache::open(&cache_path)?;
+    eprintln!("Chunk cache initialized at {}", cache_path.display());
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
@@ -69,7 +77,7 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
             Ok(msg) => {
                 let should_shutdown = matches!(msg, Message::Shutdown);
 
-                match handle_message(root, msg, &mut writer, &mut batch_mode) {
+                match handle_message(root, msg, &mut writer, &mut batch_mode, &cache) {
                     Ok(BatchResponse::Normal) => {}
                     Ok(BatchResponse::BatchStarted) => {
                         batch_errors.clear();
@@ -126,6 +134,7 @@ fn handle_message<W: Write>(
     msg: Message,
     writer: &mut ProtocolWriter<W>,
     batch_mode: &mut bool,
+    cache: &ChunkCache,
 ) -> Result<BatchResponse> {
     match msg {
         Message::SnapshotReq => {
@@ -182,8 +191,44 @@ fn handle_message<W: Write>(
         Message::SignatureReq { path } => {
             let full_path = root.join(&path);
             let data = std::fs::read(&full_path)?;
-            let computer = DeltaComputer::new();
-            let sig = computer.signature(&data);
+            let file_hash = ContentHash::from_bytes(&data);
+
+            // Check cache first
+            let chunks = if let Some(cached_chunks) = cache.get_signature(&file_hash) {
+                eprintln!("Cache hit for signature: {}", path.display());
+                cached_chunks
+            } else {
+                eprintln!("Cache miss for signature: {}", path.display());
+                let computer = DeltaComputer::new();
+                let sig = computer.signature(&data);
+                // Cache the chunks for next time
+                let chunks: Vec<_> = sig
+                    .chunks
+                    .iter()
+                    .map(|c| zsync_core::Chunk {
+                        offset: c.offset,
+                        length: c.length,
+                        hash: c.hash,
+                    })
+                    .collect();
+                if let Err(e) = cache.put_signature(&file_hash, &chunks) {
+                    eprintln!("Failed to cache signature: {e}");
+                }
+                chunks
+            };
+
+            // Convert chunks back to Signature for compression
+            let sig = zsync_core::delta::Signature {
+                chunks: chunks
+                    .iter()
+                    .map(|c| zsync_core::delta::ChunkSignature {
+                        offset: c.offset,
+                        length: c.length,
+                        hash: c.hash,
+                    })
+                    .collect(),
+                file_size: data.len() as u64,
+            };
             let compressed = DeltaComputer::compress_signature(&sig)?;
             writer.send_signature_resp(&path, &compressed)?;
             Ok(BatchResponse::Normal)
