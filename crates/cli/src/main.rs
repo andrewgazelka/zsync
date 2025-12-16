@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Effects};
+use clap::{Parser, Subcommand, builder::Styles};
 use color_eyre::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
@@ -22,30 +23,32 @@ use tracing::{debug, error, info, warn};
 use zsync_core::{Scanner, Snapshot};
 use zsync_transport::SshTransport;
 
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Red.on_default());
+
 #[derive(Parser)]
 #[command(name = "zsync")]
 #[command(version)]
-#[command(about = "Fast, modern file synchronization with native gitignore support")]
+#[command(styles = STYLES)]
+#[command(about = "Fast file sync with native .gitignore support")]
 #[command(long_about = r#"
-zsync is a modern alternative to mutagen and rsync, built in Rust.
+zsync is a modern alternative to mutagen and rsync.
 
 Features:
-  • Native .gitignore support - no manual ignore patterns needed
-  • BLAKE3 hashing - fast, secure content addressing
-  • Delta sync - only transfer what changed
-  • zstd compression - efficient data transfer
-  • File watching - automatic sync on changes
-  • Zero remote dependencies - agent auto-deploys
+  • Native .gitignore - respects your existing ignore files
+  • Delta sync       - only transfers what changed
+  • Zero remote deps - agent binary auto-deploys via SSH
+  • Fast             - BLAKE3 hashing, zstd compression
 
 Examples:
-  # One-time sync
-  zsync sync ./local user@host:/remote
-
-  # Watch mode (continuous sync)
-  zsync watch ./local user@host:/remote
-
-  # Scan local directory
-  zsync scan ./project
+  zsync sync ./local user@host:/remote    One-time sync
+  zsync watch ./local user@host:/remote   Continuous sync
+  zsync scan ./project                    Scan local directory
 "#)]
 struct Cli {
     /// Enable verbose logging
