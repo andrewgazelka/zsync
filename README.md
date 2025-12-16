@@ -25,6 +25,7 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 - **Native .gitignore** — Respects your existing ignore files automatically
 - **FastCDC delta sync** — Content-defined chunking transfers only changed bytes, not whole files
 - **Watch mode** — Continuous sync with debouncing
+- **Port forwarding** — Forward local ports to remote services through SSH
 - **Static binaries** — Works on any Linux server, no glibc version issues
 - **Fast** — BLAKE3 hashing, zstd compression, heed (LMDB) signature caching
 
