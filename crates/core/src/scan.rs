@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use color_eyre::Result;
+use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,8 @@ pub struct Scanner {
     root: PathBuf,
     /// Additional ignore patterns beyond .gitignore
     extra_ignores: Vec<String>,
+    /// Patterns to force-include even if gitignored (e.g., ".env")
+    includes: Vec<String>,
 }
 
 impl Scanner {
@@ -38,6 +41,7 @@ impl Scanner {
         Self {
             root: root.into(),
             extra_ignores: Vec::new(),
+            includes: Vec::new(),
         }
     }
 
@@ -45,6 +49,15 @@ impl Scanner {
     #[must_use]
     pub fn ignore(mut self, pattern: impl Into<String>) -> Self {
         self.extra_ignores.push(pattern.into());
+        self
+    }
+
+    /// Force-include a pattern even if it matches .gitignore
+    ///
+    /// Useful for syncing files like `.env` that are normally gitignored.
+    #[must_use]
+    pub fn include(mut self, pattern: impl Into<String>) -> Self {
+        self.includes.push(pattern.into());
         self
     }
 
@@ -66,13 +79,85 @@ impl Scanner {
         builder
     }
 
+    /// Build an override matcher for force-included patterns
+    fn include_matcher(&self) -> Result<Option<ignore::overrides::Override>> {
+        if self.includes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut overrides = OverrideBuilder::new(&self.root);
+        for pattern in &self.includes {
+            overrides.add(pattern)?;
+        }
+        Ok(Some(overrides.build()?))
+    }
+
+    /// Scan for files matching include patterns (bypassing gitignore)
+    fn scan_includes(&self) -> Result<Vec<FileEntry>> {
+        if self.includes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let matcher = self.include_matcher()?.unwrap();
+        let mut entries = Vec::new();
+
+        // Walk without gitignore to find included files
+        let mut builder = WalkBuilder::new(&self.root);
+        builder
+            .hidden(false)
+            .git_ignore(false) // Bypass gitignore for includes
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .filter_entry(|e| e.file_name() != ".git");
+
+        for result in builder.build() {
+            let entry = result?;
+            let path = entry.path();
+
+            if !path.is_file() {
+                continue;
+            }
+
+            let relative_path = path.strip_prefix(&self.root)?.to_path_buf();
+
+            // Only include files matching our include patterns
+            if matcher.matched(&relative_path, false).is_whitelist() {
+                let metadata = std::fs::metadata(path)?;
+                let hash = ContentHash::from_file(path)?;
+
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = false;
+
+                entries.push(FileEntry {
+                    path: relative_path,
+                    size: metadata.len(),
+                    modified: metadata.modified()?,
+                    hash,
+                    executable,
+                });
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Scan the directory and return all file entries
     ///
     /// # Errors
     /// Returns an error if directory traversal or file reading fails
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
-        let mut entries = Vec::new();
+        use std::collections::HashSet;
 
+        let mut entries = Vec::new();
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+
+        // First, scan normally (respecting gitignore)
         for result in self.walk_builder().build() {
             let entry = result?;
             let path = entry.path();
@@ -95,6 +180,7 @@ impl Scanner {
             #[cfg(not(unix))]
             let executable = false;
 
+            seen_paths.insert(relative_path.clone());
             entries.push(FileEntry {
                 path: relative_path,
                 size: metadata.len(),
@@ -102,6 +188,13 @@ impl Scanner {
                 hash,
                 executable,
             });
+        }
+
+        // Then, add any force-included files that weren't already found
+        for included in self.scan_includes()? {
+            if !seen_paths.contains(&included.path) {
+                entries.push(included);
+            }
         }
 
         // Sort for deterministic ordering
@@ -195,5 +288,36 @@ mod tests {
         let entries = scanner.scan().unwrap();
 
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn test_include_overrides_gitignore() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), ".env\n").unwrap();
+        fs::write(dir.path().join(".env"), "SECRET=123").unwrap();
+        fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+
+        // Without include, .env should be ignored
+        let scanner = Scanner::new(dir.path());
+        let entries = scanner.scan().unwrap();
+        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
+        assert!(
+            !paths.contains(&PathBuf::from(".env")),
+            ".env should be ignored: {paths:?}"
+        );
+
+        // With include, .env should be present
+        let scanner = Scanner::new(dir.path()).include(".env");
+        let entries = scanner.scan().unwrap();
+        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
+        assert!(
+            paths.contains(&PathBuf::from(".env")),
+            ".env should be included: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("keep.txt")),
+            "keep.txt should still be present: {paths:?}"
+        );
     }
 }

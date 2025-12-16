@@ -3,7 +3,7 @@
 //! A modern alternative to mutagen/rsync with:
 //! - Native .gitignore support
 //! - BLAKE3 content-addressed hashing
-//! - Delta sync with zstd compression
+//! - Binary protocol (no JSON overhead)
 //! - Pure Rust SSH transport
 //! - File watching with debouncing
 
@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, builder::Styles};
 use color_eyre::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 use zsync_core::{Scanner, Snapshot};
 use zsync_transport::SshTransport;
@@ -43,12 +43,7 @@ Features:
   • Native .gitignore - respects your existing ignore files
   • Delta sync       - only transfers what changed
   • Zero remote deps - agent binary auto-deploys via SSH
-  • Fast             - BLAKE3 hashing, zstd compression
-
-Examples:
-  zsync sync ./local user@host:/remote    One-time sync
-  zsync watch ./local user@host:/remote   Continuous sync
-  zsync scan ./project                    Scan local directory
+  • Fast             - BLAKE3 hashing, binary protocol
 "#)]
 struct Cli {
     /// Enable verbose logging
@@ -73,6 +68,10 @@ enum Commands {
         /// SSH port
         #[arg(short, long, default_value = "22")]
         port: u16,
+
+        /// Force-include files even if gitignored (e.g., .env)
+        #[arg(short, long)]
+        include: Vec<String>,
     },
 
     /// Watch and continuously sync changes
@@ -91,6 +90,10 @@ enum Commands {
         /// Debounce delay in milliseconds
         #[arg(short, long, default_value = "100")]
         debounce: u64,
+
+        /// Force-include files even if gitignored (e.g., .env)
+        #[arg(long)]
+        include: Vec<String>,
     },
 
     /// Scan local directory and print snapshot
@@ -98,10 +101,6 @@ enum Commands {
         /// Directory to scan
         #[arg(default_value = ".")]
         path: PathBuf,
-
-        /// Output format (json, summary)
-        #[arg(short, long, default_value = "summary")]
-        format: String,
     },
 
     /// Show version and build info
@@ -124,61 +123,54 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Version => {
             eprintln!("zsync {}", env!("CARGO_PKG_VERSION"));
-            eprintln!("Built with Rust {}", env!("CARGO_PKG_RUST_VERSION"));
         }
-        Commands::Scan { path, format } => {
-            scan_command(&path, &format)?;
+        Commands::Scan { path } => {
+            scan_command(&path)?;
         }
         Commands::Sync {
             local,
             remote,
             port,
+            include,
         } => {
-            sync_command(&local, &remote, port).await?;
+            sync_command(&local, &remote, port, &include).await?;
         }
         Commands::Watch {
             local,
             remote,
             port,
             debounce,
+            include,
         } => {
-            watch_command(&local, &remote, port, debounce).await?;
+            watch_command(&local, &remote, port, debounce, &include).await?;
         }
     }
 
     Ok(())
 }
 
-fn scan_command(path: &PathBuf, format: &str) -> Result<()> {
+fn scan_command(path: &PathBuf) -> Result<()> {
     info!("Scanning {}...", path.display());
 
     let scanner = Scanner::new(path);
     let entries = scanner.scan()?;
     let snapshot = Snapshot::from_entries(entries);
 
-    match format {
-        "json" => {
-            let json = serde_json::to_string_pretty(&snapshot)?;
-            eprintln!("{json}");
-        }
-        _ => {
-            eprintln!("Files: {}", snapshot.len());
-            let total_size: u64 = snapshot.files.values().map(|f| f.size).sum();
-            eprintln!("Total size: {total_size} bytes");
+    eprintln!("Files: {}", snapshot.len());
+    let total_size: u64 = snapshot.files.values().map(|f| f.size).sum();
+    eprintln!("Total size: {} bytes", total_size);
 
-            if snapshot.len() <= 20 {
-                eprintln!("\nFiles:");
-                for (path, entry) in &snapshot.files {
-                    eprintln!("  {} ({} bytes)", path.display(), entry.size);
-                }
-            }
+    if snapshot.len() <= 20 {
+        eprintln!("\nFiles:");
+        for (path, entry) in &snapshot.files {
+            eprintln!("  {} ({} bytes)", path.display(), entry.size);
         }
     }
 
     Ok(())
 }
 
-async fn sync_command(local: &PathBuf, remote: &str, port: u16) -> Result<()> {
+async fn sync_command(local: &PathBuf, remote: &str, port: u16, includes: &[String]) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
     info!(
@@ -191,33 +183,98 @@ async fn sync_command(local: &PathBuf, remote: &str, port: u16) -> Result<()> {
 
     // Scan local
     info!("Scanning local directory...");
-    let scanner = Scanner::new(local);
+    let mut scanner = Scanner::new(local);
+    for pattern in includes {
+        scanner = scanner.include(pattern);
+    }
     let entries = scanner.scan()?;
     let local_snapshot = Snapshot::from_entries(entries);
     info!("Found {} local files", local_snapshot.len());
 
     // Connect to remote
-    info!("Connecting to remote...");
     let mut transport = SshTransport::connect(&host, port, &user).await?;
 
     // Deploy agent
     let bundle = embedded_agents::embedded_bundle();
     if bundle.platforms().is_empty() {
-        warn!("No embedded agent binaries - remote must have zsync-agent installed");
-    } else {
-        let agent_path = transport.ensure_agent(&bundle).await?;
-        info!("Agent ready at {agent_path:?}");
+        return Err(color_eyre::eyre::eyre!(
+            "No embedded agent binaries - cannot sync"
+        ));
     }
 
-    // TODO: Get remote snapshot via agent
-    // TODO: Compute diff
-    // TODO: Transfer changed files
+    transport.ensure_agent(&bundle).await?;
+
+    // Start agent
+    info!("Starting remote agent...");
+    let mut agent = transport.start_agent(&remote_path).await?;
+
+    // Get remote snapshot
+    info!("Getting remote snapshot...");
+    let remote_snapshot = agent.snapshot().await?;
+    info!("Found {} remote files", remote_snapshot.len());
+
+    // Compute diff
+    let diff = remote_snapshot.diff(&local_snapshot);
+
+    if diff.is_empty() {
+        info!("Already in sync!");
+    } else {
+        info!(
+            "Changes: {} added, {} modified, {} deleted",
+            diff.added.len(),
+            diff.modified.len(),
+            diff.removed.len()
+        );
+
+        // Transfer added and modified files
+        let to_transfer: Vec<_> = diff.added.iter().chain(diff.modified.iter()).collect();
+
+        for (i, path) in to_transfer.iter().enumerate() {
+            let entry = local_snapshot
+                .files
+                .get(*path)
+                .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+
+            let full_path = local.join(path);
+            let data = std::fs::read(&full_path)?;
+
+            info!(
+                "[{}/{}] Uploading {} ({} bytes)",
+                i + 1,
+                to_transfer.len(),
+                path.display(),
+                data.len()
+            );
+
+            agent.write_file(path, &data, entry.executable).await?;
+        }
+
+        // Delete removed files
+        for (i, path) in diff.removed.iter().enumerate() {
+            info!(
+                "[{}/{}] Deleting {}",
+                i + 1,
+                diff.removed.len(),
+                path.display()
+            );
+            agent.delete_file(path).await?;
+        }
+    }
+
+    // Shutdown agent
+    agent.shutdown().await?;
 
     info!("Sync complete!");
     Ok(())
 }
 
-async fn watch_command(local: &PathBuf, remote: &str, port: u16, debounce_ms: u64) -> Result<()> {
+async fn watch_command(
+    local: &PathBuf,
+    remote: &str,
+    port: u16,
+    debounce_ms: u64,
+    includes: &[String],
+) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
     info!(
@@ -229,7 +286,7 @@ async fn watch_command(local: &PathBuf, remote: &str, port: u16, debounce_ms: u6
     );
 
     // Initial sync
-    sync_command(local, remote, port).await?;
+    sync_command(local, remote, port, includes).await?;
 
     // Setup file watcher
     let (tx, rx) = mpsc::channel();
@@ -259,17 +316,14 @@ async fn watch_command(local: &PathBuf, remote: &str, port: u16, debounce_ms: u6
                 }
 
                 info!("Detected {} changed paths, syncing...", paths.len());
-                for path in &paths {
-                    debug!("  Changed: {}", path.display());
-                }
 
                 // Re-sync
-                if let Err(e) = sync_command(local, remote, port).await {
-                    error!("Sync failed: {}", e);
+                if let Err(e) = sync_command(local, remote, port, includes).await {
+                    error!("Sync failed: {e}");
                 }
             }
             Err(e) => {
-                error!("Watch error: {}", e);
+                error!("Watch error: {e}");
                 break;
             }
         }
@@ -280,7 +334,6 @@ async fn watch_command(local: &PathBuf, remote: &str, port: u16, debounce_ms: u6
 
 /// Parse remote string like "user@host:/path" into components
 fn parse_remote(remote: &str) -> Result<(String, String, String)> {
-    // Format: user@host:/path or user@host:path
     let at_pos = remote.find('@').ok_or_else(|| {
         color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path")
     })?;
