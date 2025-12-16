@@ -14,7 +14,7 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 
 | Feature | rsync | mutagen | zsync |
 |---------|-------|---------|-------|
-| Remote dependencies | rsync required | mutagen required | **None** |
+| Remote dependencies | rsync required | Auto-deploy (~50MB Go) | Auto-deploy (~3MB Rust) |
 | Respects .gitignore | ❌ Manual exclude | ⚠️ Separate config | ✅ **Automatic** |
 | Watch mode | ❌ External tools | ✅ Built-in | ✅ Built-in |
 | Delta sync | ✅ | ✅ | ✅ |
