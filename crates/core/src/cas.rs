@@ -26,10 +26,13 @@ impl ChunkStore {
     ///
     /// # Errors
     /// Returns an error if the database cannot be opened or created.
+    #[allow(unsafe_code)]
     pub fn open(path: &Path) -> color_eyre::Result<Self> {
         std::fs::create_dir_all(path)?;
 
-        // SAFETY: Standard LMDB memory-mapped I/O
+        // SAFETY: Standard LMDB memory-mapped I/O.
+        // The only requirement is that the database file is not modified
+        // externally while the Env is open.
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(4 * 1024 * 1024 * 1024) // 4GB max - chunks can be large

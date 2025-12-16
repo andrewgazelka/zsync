@@ -72,11 +72,14 @@ impl ChunkCache {
     ///
     /// # Errors
     /// Returns an error if the database cannot be opened or created.
+    #[allow(unsafe_code)]
     pub fn open(path: &Path) -> color_eyre::Result<Self> {
         std::fs::create_dir_all(path)?;
 
         // SAFETY: We're opening the database with standard settings.
         // The unsafe is required by heed for memory-mapped I/O.
+        // The only requirement is that the database file is not modified
+        // externally while the Env is open.
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(256 * 1024 * 1024) // 256MB max
@@ -243,7 +246,7 @@ mod tests {
 
         let path = "/some/file/path.rs";
         let size = 12345u64;
-        let mtime = 1700000000u64;
+        let mtime = 1_700_000_000_u64;
         let hash = ContentHash::from_bytes(b"file content hash");
 
         // Initially empty

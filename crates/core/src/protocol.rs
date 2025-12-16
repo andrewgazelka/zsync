@@ -482,6 +482,7 @@ impl<R: Read> ProtocolReader<R> {
     }
 
     /// Read next message
+    #[allow(clippy::too_many_lines)]
     pub fn read_message(&mut self) -> Result<Message> {
         let (msg_type, len) = read_header(&mut self.inner)?;
 

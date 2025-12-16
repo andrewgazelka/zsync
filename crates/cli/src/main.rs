@@ -309,15 +309,15 @@ async fn transfer_files_cas(
 
     let total_chunk_bytes: usize = chunks_to_send.iter().map(|(_, d)| d.len()).sum();
 
-    if !chunks_to_send.is_empty() {
+    if chunks_to_send.is_empty() {
+        info!("All chunks already on server (deduplication win!)");
+    } else {
         info!(
             "Transferring {} missing chunks ({})...",
             chunks_to_send.len(),
             humansize::format_size(total_chunk_bytes, humansize::BINARY)
         );
         agent.store_chunks(&chunks_to_send).await?;
-    } else {
-        info!("All chunks already on server (deduplication win!)");
     }
 
     // Send file manifests and deletes in a batch
@@ -411,7 +411,7 @@ async fn sync_once(
 
     // Print individual file changes with sizes
     for path in &diff.added {
-        let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+        let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
         info!(
             "  + {} ({})",
             path.display(),
@@ -419,7 +419,7 @@ async fn sync_once(
         );
     }
     for path in &diff.modified {
-        let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+        let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
         info!(
             "  ~ {} ({})",
             path.display(),
@@ -434,13 +434,16 @@ async fn sync_once(
 
     // Collect all files to transfer
     let mut all_paths: Vec<&Path> = Vec::new();
-    all_paths.extend(diff.added.iter().map(|p| p.as_path()));
-    all_paths.extend(diff.modified.iter().map(|p| p.as_path()));
+    all_paths.extend(diff.added.iter().map(std::path::PathBuf::as_path));
+    all_paths.extend(diff.modified.iter().map(std::path::PathBuf::as_path));
 
     let to_delete: Vec<&Path> = if no_delete {
         vec![]
     } else {
-        diff.removed.iter().map(|p| p.as_path()).collect()
+        diff.removed
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect()
     };
 
     if !all_paths.is_empty() || !to_delete.is_empty() {
@@ -478,6 +481,7 @@ async fn connect_and_start_agent(
     Ok((transport, agent))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn sync_command(
     local: &PathBuf,
     remote: &str,
@@ -554,7 +558,7 @@ async fn sync_command(
         );
 
         for path in &diff.added {
-            let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+            let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
             info!(
                 "  + {} ({})",
                 path.display(),
@@ -562,7 +566,7 @@ async fn sync_command(
             );
         }
         for path in &diff.modified {
-            let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+            let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
             info!(
                 "  ~ {} ({})",
                 path.display(),
@@ -584,13 +588,16 @@ async fn sync_command(
 
         // Collect all files to transfer
         let mut all_paths: Vec<&Path> = Vec::new();
-        all_paths.extend(diff.added.iter().map(|p| p.as_path()));
-        all_paths.extend(diff.modified.iter().map(|p| p.as_path()));
+        all_paths.extend(diff.added.iter().map(std::path::PathBuf::as_path));
+        all_paths.extend(diff.modified.iter().map(std::path::PathBuf::as_path));
 
         let to_delete: Vec<&Path> = if no_delete {
             vec![]
         } else {
-            diff.removed.iter().map(|p| p.as_path()).collect()
+            diff.removed
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .collect()
         };
 
         if !all_paths.is_empty() || !to_delete.is_empty() {

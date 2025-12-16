@@ -158,8 +158,7 @@ mod tests {
     fn test_empty_data() {
         let data = b"";
         let config = ChunkConfig::default();
-        let chunks: Vec<_> = chunk_data(data, &config).collect();
-        assert!(chunks.is_empty());
+        assert!(chunk_data(data, &config).next().is_none());
     }
 
     #[test]

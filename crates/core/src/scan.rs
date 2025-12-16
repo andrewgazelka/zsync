@@ -126,7 +126,7 @@ impl Scanner {
         // Collect matching file paths first (cheap)
         let paths: Vec<_> = builder
             .build()
-            .filter_map(|r| r.ok())
+            .filter_map(std::result::Result::ok)
             .filter_map(|entry| {
                 let path = entry.into_path();
                 if !path.is_file() {
@@ -146,9 +146,9 @@ impl Scanner {
             .into_par_iter()
             .map(|(path, relative_path)| {
                 let metadata = std::fs::metadata(&path)
-                    .wrap_err_with(|| format!("failed to read metadata for {path:?}"))?;
+                    .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?;
                 let hash = ContentHash::from_file(&path)
-                    .wrap_err_with(|| format!("failed to hash {path:?}"))?;
+                    .wrap_err_with(|| format!("failed to hash {}", path.display()))?;
 
                 #[cfg(unix)]
                 let executable = {
@@ -180,7 +180,7 @@ impl Scanner {
         let paths: Vec<_> = self
             .walk_builder()
             .build()
-            .filter_map(|r| r.ok())
+            .filter_map(std::result::Result::ok)
             .filter_map(|entry| {
                 let path = entry.into_path();
                 if !path.is_file() {
@@ -196,9 +196,9 @@ impl Scanner {
             .into_par_iter()
             .map(|(path, relative_path)| {
                 let metadata = std::fs::metadata(&path)
-                    .wrap_err_with(|| format!("failed to read metadata for {path:?}"))?;
+                    .wrap_err_with(|| format!("failed to read metadata for {}", path.display()))?;
                 let hash = ContentHash::from_file(&path)
-                    .wrap_err_with(|| format!("failed to hash {path:?}"))?;
+                    .wrap_err_with(|| format!("failed to hash {}", path.display()))?;
 
                 #[cfg(unix)]
                 let executable = {

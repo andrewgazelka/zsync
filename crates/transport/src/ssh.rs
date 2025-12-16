@@ -437,7 +437,7 @@ pub struct BatchResult {
 /// Supports * as wildcard (matches any characters)
 fn glob_match(pattern: &str, text: &str) -> bool {
     let mut pattern_chars = pattern.chars().peekable();
-    let mut text_chars = text.chars().peekable();
+    let mut text_chars = text.chars();
 
     while let Some(p) = pattern_chars.next() {
         match p {
@@ -656,23 +656,17 @@ impl SshTransport {
     fn parse_ssh_config(host: &str) -> SshHostConfig {
         use std::io::BufRead;
 
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                return SshHostConfig {
-                    identity_agent: None,
-                };
-            }
+        let Some(home) = dirs::home_dir() else {
+            return SshHostConfig {
+                identity_agent: None,
+            };
         };
 
         let ssh_config_path = home.join(".ssh/config");
-        let file = match std::fs::File::open(&ssh_config_path) {
-            Ok(f) => f,
-            Err(_) => {
-                return SshHostConfig {
-                    identity_agent: None,
-                };
-            }
+        let Ok(file) = std::fs::File::open(&ssh_config_path) else {
+            return SshHostConfig {
+                identity_agent: None,
+            };
         };
 
         let reader = std::io::BufReader::new(file);
@@ -701,8 +695,8 @@ impl SshTransport {
                 .or_else(|| line.strip_prefix("IdentityAgent\t"))
             {
                 let agent = agent.trim().trim_matches('"').trim_matches('\'');
-                let expanded = if agent.starts_with("~/") {
-                    home.join(&agent[2..])
+                let expanded = if let Some(stripped) = agent.strip_prefix("~/") {
+                    home.join(stripped)
                 } else {
                     PathBuf::from(agent)
                 };

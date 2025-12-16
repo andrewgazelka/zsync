@@ -134,6 +134,7 @@ enum BatchResponse {
     BatchOp,
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_message<W: Write>(
     root: &PathBuf,
     msg: Message,
@@ -278,7 +279,7 @@ fn handle_message<W: Write>(
         Message::StoreChunks { chunks } => {
             eprintln!("StoreChunks: storing {} chunks", chunks.len());
             let new_count = cas.put_many(&chunks)?;
-            eprintln!("StoreChunks: {} new chunks stored", new_count);
+            eprintln!("StoreChunks: {new_count} new chunks stored");
             writer.send_ok()?;
             Ok(BatchResponse::Normal)
         }
