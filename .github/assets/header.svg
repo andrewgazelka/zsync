@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 160">
+  <style>
+    .title { fill: #1f2328; }
+    .subtitle { fill: #656d76; }
+    .accent { fill: #3b82f6; }
+    .arrow { fill: none; stroke: #3b82f6; stroke-width: 3; stroke-linecap: round; }
+
+    @media (prefers-color-scheme: dark) {
+      .title { fill: #ffffff; }
+      .subtitle { fill: #8b949e; }
+    }
+
+    @keyframes sync {
+      0%, 100% { transform: translateX(0); opacity: 1; }
+      50% { transform: translateX(8px); opacity: 0.6; }
+    }
+    .arrow-animated { animation: sync 1.5s ease-in-out infinite; }
+  </style>
+
+  <!-- Sync icon: two folders with arrows -->
+  <g transform="translate(40, 40)">
+    <!-- Local folder -->
+    <g transform="translate(0, 0)">
+      <path class="accent" d="M0 8 L0 56 C0 60 2 62 6 62 L42 62 C46 62 48 60 48 56 L48 16 C48 12 46 10 42 10 L26 10 L22 4 C21 2 19 0 16 0 L6 0 C2 0 0 2 0 6 Z" opacity="0.9"/>
+      <rect fill="white" opacity="0.3" x="6" y="20" width="36" height="3" rx="1.5"/>
+      <rect fill="white" opacity="0.3" x="6" y="28" width="28" height="3" rx="1.5"/>
+      <rect fill="white" opacity="0.3" x="6" y="36" width="32" height="3" rx="1.5"/>
+    </g>
+
+    <!-- Sync arrows -->
+    <g class="arrow-animated" transform="translate(58, 20)">
+      <path class="arrow" d="M0 12 L20 12 M14 6 L20 12 L14 18"/>
+    </g>
+    <g class="arrow-animated" transform="translate(58, 38)" style="animation-delay: 0.3s;">
+      <path class="arrow" d="M20 12 L0 12 M6 6 L0 12 L6 18"/>
+    </g>
+
+    <!-- Remote folder (server) -->
+    <g transform="translate(88, 0)">
+      <path class="accent" d="M0 8 L0 56 C0 60 2 62 6 62 L42 62 C46 62 48 60 48 56 L48 16 C48 12 46 10 42 10 L26 10 L22 4 C21 2 19 0 16 0 L6 0 C2 0 0 2 0 6 Z" opacity="0.7"/>
+      <circle fill="white" opacity="0.4" cx="24" cy="36" r="12"/>
+      <path fill="white" opacity="0.6" d="M20 32 L20 40 M24 32 L24 40 M28 32 L28 40" stroke="white" stroke-width="2" stroke-linecap="round"/>
+    </g>
+  </g>
+
+  <!-- Title -->
+  <text class="title" x="190" y="75" font-family="system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="52" font-weight="700">zsync</text>
+
+  <!-- Subtitle -->
+  <text class="subtitle" x="190" y="105" font-family="system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="16">Fast file sync with native .gitignore support</text>
+</svg>
