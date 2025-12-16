@@ -40,7 +40,3 @@ let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)?;
 // Zero-copy deserialize
 let archived = rkyv::access::<ArchivedCachedData, rkyv::rancor::Error>(&bytes)?;
 ```
-
-### TODO: Migrate delta.rs
-
-`delta.rs` currently uses `serde_json` for `Delta` and `Signature` compression. This should be migrated to rkyv. The `DeltaOp::Literal` uses `bytes::Bytes` which needs a wrapper for rkyv.

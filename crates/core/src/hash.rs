@@ -7,7 +7,19 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// A content hash using BLAKE3 (256-bit)
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[rkyv(compare(PartialEq), derive(Debug, Hash))]
 pub struct ContentHash([u8; 32]);
 
 impl ContentHash {

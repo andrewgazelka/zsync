@@ -2,20 +2,22 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use rkyv::rancor::Error as RkyvError;
 
 use crate::chunker::{ChunkConfig, chunk_data};
 use crate::hash::ContentHash;
 
 /// Protocol version for signature/delta format
-const PROTOCOL_VERSION: u8 = 2;
+/// v2 = JSON + zstd (legacy)
+/// v3 = rkyv + zstd (current)
+const PROTOCOL_VERSION: u8 = 3;
 
 /// A signature for a file, used to compute deltas.
 ///
 /// Uses content-defined chunks (FastCDC) for better deduplication
 /// when content is inserted or deleted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct Signature {
     /// Chunk signatures
     pub chunks: Vec<ChunkSignature>,
@@ -24,7 +26,8 @@ pub struct Signature {
 }
 
 /// Signature for a single content-defined chunk
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct ChunkSignature {
     /// Byte offset in original file
     pub offset: u64,
@@ -35,7 +38,8 @@ pub struct ChunkSignature {
 }
 
 /// An operation in a delta
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum DeltaOp {
     /// Copy a chunk from the original file at given offset/length
     CopyChunk {
@@ -46,13 +50,14 @@ pub enum DeltaOp {
     },
     /// Insert literal data
     Literal {
-        /// Raw bytes to insert
-        data: Bytes,
+        /// Raw bytes to insert (Vec for rkyv compatibility)
+        data: Vec<u8>,
     },
 }
 
 /// A delta between two versions of a file
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct Delta {
     /// Operations to reconstruct the new file from the old
     pub ops: Vec<DeltaOp>,
@@ -136,7 +141,7 @@ impl DeltaComputer {
                     let end = chunk.offset as usize;
                     if start < end {
                         ops.push(DeltaOp::Literal {
-                            data: Bytes::copy_from_slice(&new_data[start..end]),
+                            data: new_data[start..end].to_vec(),
                         });
                     }
                 }
@@ -157,7 +162,7 @@ impl DeltaComputer {
         if let Some(start) = literal_start {
             if start < new_data.len() {
                 ops.push(DeltaOp::Literal {
-                    data: Bytes::copy_from_slice(&new_data[start..]),
+                    data: new_data[start..].to_vec(),
                 });
             }
         }
@@ -165,7 +170,7 @@ impl DeltaComputer {
         // Handle empty file case
         if new_chunks.is_empty() && !new_data.is_empty() {
             ops.push(DeltaOp::Literal {
-                data: Bytes::copy_from_slice(new_data),
+                data: new_data.to_vec(),
             });
         }
 
@@ -220,15 +225,16 @@ impl DeltaComputer {
         Ok(result)
     }
 
-    /// Compress delta data using zstd.
+    /// Compress delta data using rkyv + zstd.
     ///
     /// Prepends a version byte for forward compatibility.
     ///
     /// # Errors
-    /// Returns an error if compression fails.
+    /// Returns an error if serialization or compression fails.
     pub fn compress_delta(delta: &Delta) -> color_eyre::Result<Vec<u8>> {
-        let json = serde_json::to_vec(delta)?;
-        let compressed = zstd::encode_all(json.as_slice(), 3)?;
+        let bytes = rkyv::to_bytes::<RkyvError>(delta)
+            .map_err(|e| color_eyre::eyre::eyre!("rkyv serialization failed: {e}"))?;
+        let compressed = zstd::encode_all(bytes.as_slice(), 3)?;
 
         // Prepend version byte
         let mut result = Vec::with_capacity(1 + compressed.len());
@@ -251,24 +257,28 @@ impl DeltaComputer {
         let payload = &data[1..];
 
         match version {
-            2 => {
+            3 => {
                 let decompressed = zstd::decode_all(payload)?;
-                let delta: Delta = serde_json::from_slice(&decompressed)?;
+                let archived = rkyv::access::<ArchivedDelta, RkyvError>(&decompressed)
+                    .map_err(|e| color_eyre::eyre::eyre!("rkyv access failed: {e}"))?;
+                let delta: Delta = rkyv::deserialize::<Delta, RkyvError>(archived)
+                    .map_err(|e| color_eyre::eyre::eyre!("rkyv deserialize failed: {e}"))?;
                 Ok(delta)
             }
-            v => color_eyre::eyre::bail!("unsupported delta protocol version: {v}"),
+            v => color_eyre::eyre::bail!("unsupported delta protocol version: {v} (expected 3)"),
         }
     }
 
-    /// Compress signature data using zstd.
+    /// Compress signature data using rkyv + zstd.
     ///
     /// Prepends a version byte for forward compatibility.
     ///
     /// # Errors
-    /// Returns an error if compression fails.
+    /// Returns an error if serialization or compression fails.
     pub fn compress_signature(sig: &Signature) -> color_eyre::Result<Vec<u8>> {
-        let json = serde_json::to_vec(sig)?;
-        let compressed = zstd::encode_all(json.as_slice(), 3)?;
+        let bytes = rkyv::to_bytes::<RkyvError>(sig)
+            .map_err(|e| color_eyre::eyre::eyre!("rkyv serialization failed: {e}"))?;
+        let compressed = zstd::encode_all(bytes.as_slice(), 3)?;
 
         // Prepend version byte
         let mut result = Vec::with_capacity(1 + compressed.len());
@@ -291,12 +301,17 @@ impl DeltaComputer {
         let payload = &data[1..];
 
         match version {
-            2 => {
+            3 => {
                 let decompressed = zstd::decode_all(payload)?;
-                let sig: Signature = serde_json::from_slice(&decompressed)?;
+                let archived = rkyv::access::<ArchivedSignature, RkyvError>(&decompressed)
+                    .map_err(|e| color_eyre::eyre::eyre!("rkyv access failed: {e}"))?;
+                let sig: Signature = rkyv::deserialize::<Signature, RkyvError>(archived)
+                    .map_err(|e| color_eyre::eyre::eyre!("rkyv deserialize failed: {e}"))?;
                 Ok(sig)
             }
-            v => color_eyre::eyre::bail!("unsupported signature protocol version: {v}"),
+            v => {
+                color_eyre::eyre::bail!("unsupported signature protocol version: {v} (expected 3)")
+            }
         }
     }
 }
@@ -315,9 +330,7 @@ fn merge_literals(ops: Vec<DeltaOp>) -> Vec<DeltaOp> {
             }
             DeltaOp::CopyChunk { .. } => {
                 if let Some(data) = pending_literal.take() {
-                    result.push(DeltaOp::Literal {
-                        data: Bytes::from(data),
-                    });
+                    result.push(DeltaOp::Literal { data });
                 }
                 result.push(op);
             }
@@ -325,9 +338,7 @@ fn merge_literals(ops: Vec<DeltaOp>) -> Vec<DeltaOp> {
     }
 
     if let Some(data) = pending_literal {
-        result.push(DeltaOp::Literal {
-            data: Bytes::from(data),
-        });
+        result.push(DeltaOp::Literal { data });
     }
 
     result

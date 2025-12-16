@@ -3471,7 +3471,6 @@ dependencies = [
  "rayon",
  "rkyv",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "toml",
