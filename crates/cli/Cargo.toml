@@ -20,6 +20,7 @@ clap.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 dirs.workspace = true
+zstd.workspace = true
 
 zsync-core = { path = "../core" }
 zsync-transport = { path = "../transport" }

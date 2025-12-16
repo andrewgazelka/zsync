@@ -198,6 +198,144 @@ impl AgentSession {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    // ========== Batch Operations (Pipelining) ==========
+
+    /// Start a batch of operations. Operations within a batch are pipelined
+    /// (sent without waiting for individual ACKs). Call `end_batch` to get results.
+    pub async fn start_batch(&mut self, count: u32) -> Result<()> {
+        let mut msg = Vec::with_capacity(9);
+        msg.push(protocol::msg::BATCH_START);
+        msg.extend_from_slice(&4u32.to_be_bytes()); // payload len
+        msg.extend_from_slice(&count.to_be_bytes());
+        self.send(&msg).await
+    }
+
+    /// Queue a file write in batch mode (no ACK until end_batch)
+    pub async fn queue_write_file(
+        &mut self,
+        path: &Path,
+        data: &[u8],
+        executable: bool,
+    ) -> Result<()> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len() + 1 + data.len();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::WRITE_FILE);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+        msg.push(u8::from(executable));
+        msg.extend_from_slice(data);
+
+        self.send(&msg).await
+    }
+
+    /// Queue a file deletion in batch mode (no ACK until end_batch)
+    pub async fn queue_delete_file(&mut self, path: &Path) -> Result<()> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::DELETE_FILE);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+
+        self.send(&msg).await
+    }
+
+    /// Queue a delta write in batch mode (no ACK until end_batch)
+    pub async fn queue_write_delta(
+        &mut self,
+        path: &Path,
+        delta: &[u8],
+        executable: bool,
+    ) -> Result<()> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len() + 1 + 4 + delta.len();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::WRITE_DELTA);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+        msg.push(u8::from(executable));
+        msg.extend_from_slice(&(delta.len() as u32).to_be_bytes());
+        msg.extend_from_slice(delta);
+
+        self.send(&msg).await
+    }
+
+    /// End the batch and get results
+    pub async fn end_batch(&mut self) -> Result<BatchResult> {
+        self.send(&[protocol::msg::BATCH_END, 0, 0, 0, 0]).await?;
+
+        match self.read_message().await? {
+            Message::BatchResult {
+                success_count,
+                errors,
+            } => Ok(BatchResult {
+                success_count,
+                errors,
+            }),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Batch failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    // ========== Delta Operations ==========
+
+    /// Request signature for a file on the remote (for delta computation)
+    pub async fn get_signature(&mut self, path: &Path) -> Result<Vec<u8>> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::SIGNATURE_REQ);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+
+        self.send(&msg).await?;
+
+        match self.read_message().await? {
+            Message::SignatureResp { signature, .. } => Ok(signature),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Signature request failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    /// Write a file using delta transfer
+    pub async fn write_delta(&mut self, path: &Path, delta: &[u8], executable: bool) -> Result<()> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len() + 1 + 4 + delta.len();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::WRITE_DELTA);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+        msg.push(u8::from(executable));
+        msg.extend_from_slice(&(delta.len() as u32).to_be_bytes());
+        msg.extend_from_slice(delta);
+
+        self.send(&msg).await?;
+
+        match self.read_message().await? {
+            Message::Ok => Ok(()),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Delta write failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+}
+
+/// Result of a batch operation
+#[derive(Debug)]
+pub struct BatchResult {
+    pub success_count: u32,
+    pub errors: Vec<(u32, String)>,
 }
 
 /// Simple glob matching for SSH host patterns

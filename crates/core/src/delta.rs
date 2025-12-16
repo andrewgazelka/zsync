@@ -210,6 +210,26 @@ impl DeltaComputer {
         let delta: Delta = serde_json::from_slice(&decompressed)?;
         Ok(delta)
     }
+
+    /// Compress signature data using zstd
+    ///
+    /// # Errors
+    /// Returns an error if compression fails
+    pub fn compress_signature(sig: &Signature) -> Result<Vec<u8>> {
+        let json = serde_json::to_vec(sig)?;
+        let compressed = zstd::encode_all(json.as_slice(), 3)?;
+        Ok(compressed)
+    }
+
+    /// Decompress signature data
+    ///
+    /// # Errors
+    /// Returns an error if decompression or deserialization fails
+    pub fn decompress_signature(data: &[u8]) -> Result<Signature> {
+        let decompressed = zstd::decode_all(data)?;
+        let sig: Signature = serde_json::from_slice(&decompressed)?;
+        Ok(sig)
+    }
 }
 
 /// Calculate compression ratio for a delta

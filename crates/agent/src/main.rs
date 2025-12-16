@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 
-use zsync_core::{Message, ProtocolReader, ProtocolWriter, Scanner, Snapshot};
+use zsync_core::{DeltaComputer, Message, ProtocolReader, ProtocolWriter, Scanner, Snapshot};
 
 #[derive(Parser)]
 #[command(name = "zsync-agent")]
@@ -59,15 +59,43 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
 
     let mut reader = ProtocolReader::new(BufReader::new(stdin.lock()));
     let mut writer = ProtocolWriter::new(BufWriter::new(stdout.lock()));
+    let mut batch_mode = false;
+    let mut batch_errors: Vec<(u32, String)> = Vec::new();
+    let mut batch_index: u32 = 0;
+    let mut batch_success: u32 = 0;
 
     loop {
         match reader.read_message() {
             Ok(msg) => {
                 let should_shutdown = matches!(msg, Message::Shutdown);
 
-                if let Err(e) = handle_message(root, msg, &mut writer) {
-                    eprintln!("Error handling message: {e}");
-                    let _ = writer.send_error(&e.to_string());
+                match handle_message(root, msg, &mut writer, &mut batch_mode) {
+                    Ok(BatchResponse::Normal) => {}
+                    Ok(BatchResponse::BatchStarted) => {
+                        batch_errors.clear();
+                        batch_index = 0;
+                        batch_success = 0;
+                    }
+                    Ok(BatchResponse::BatchEnded) => {
+                        // Send batch result
+                        if let Err(e) = writer.send_batch_result(batch_success, &batch_errors) {
+                            eprintln!("Error sending batch result: {e}");
+                        }
+                        batch_mode = false;
+                    }
+                    Ok(BatchResponse::BatchOp) => {
+                        batch_success += 1;
+                        batch_index += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Error handling message: {e}");
+                        if batch_mode {
+                            batch_errors.push((batch_index, e.to_string()));
+                            batch_index += 1;
+                        } else {
+                            let _ = writer.send_error(&e.to_string());
+                        }
+                    }
                 }
 
                 if should_shutdown {
@@ -86,15 +114,24 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+enum BatchResponse {
+    Normal,
+    BatchStarted,
+    BatchEnded,
+    BatchOp,
+}
+
 fn handle_message<W: Write>(
     root: &PathBuf,
     msg: Message,
     writer: &mut ProtocolWriter<W>,
-) -> Result<()> {
+    batch_mode: &mut bool,
+) -> Result<BatchResponse> {
     match msg {
         Message::SnapshotReq => {
             let snapshot = scan_directory(root)?;
             writer.send_snapshot_resp(&snapshot)?;
+            Ok(BatchResponse::Normal)
         }
 
         Message::WriteFile {
@@ -104,29 +141,87 @@ fn handle_message<W: Write>(
         } => {
             let full_path = root.join(&path);
             write_file(&full_path, &data, executable)?;
-            writer.send_ok()?;
+            if *batch_mode {
+                Ok(BatchResponse::BatchOp)
+            } else {
+                writer.send_ok()?;
+                Ok(BatchResponse::Normal)
+            }
         }
 
         Message::DeleteFile { path } => {
             let full_path = root.join(&path);
-            match std::fs::remove_file(&full_path) {
-                Ok(()) => writer.send_ok()?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => writer.send_ok()?,
-                Err(e) => return Err(e.into()),
+            if let Err(e) = std::fs::remove_file(&full_path) {
+                // Ignore "not found" errors
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+            if *batch_mode {
+                Ok(BatchResponse::BatchOp)
+            } else {
+                writer.send_ok()?;
+                Ok(BatchResponse::Normal)
             }
         }
 
         Message::Shutdown => {
             writer.send_ok()?;
+            Ok(BatchResponse::Normal)
+        }
+
+        // Batch operations
+        Message::BatchStart { count: _ } => {
+            *batch_mode = true;
+            Ok(BatchResponse::BatchStarted)
+        }
+
+        Message::BatchEnd => Ok(BatchResponse::BatchEnded),
+
+        // Delta operations
+        Message::SignatureReq { path } => {
+            let full_path = root.join(&path);
+            let data = std::fs::read(&full_path)?;
+            let computer = DeltaComputer::new();
+            let sig = computer.signature(&data);
+            let compressed = DeltaComputer::compress_signature(&sig)?;
+            writer.send_signature_resp(&path, &compressed)?;
+            Ok(BatchResponse::Normal)
+        }
+
+        Message::WriteDelta {
+            path,
+            delta,
+            executable,
+        } => {
+            let full_path = root.join(&path);
+
+            // Read existing file (if any) to apply delta
+            let old_data = std::fs::read(&full_path).unwrap_or_default();
+            let delta = DeltaComputer::decompress_delta(&delta)?;
+            let computer = DeltaComputer::new();
+            let new_data = computer.apply(&old_data, &delta)?;
+
+            write_file(&full_path, &new_data, executable)?;
+
+            if *batch_mode {
+                Ok(BatchResponse::BatchOp)
+            } else {
+                writer.send_ok()?;
+                Ok(BatchResponse::Normal)
+            }
         }
 
         // These are responses, not requests - shouldn't receive them
-        Message::SnapshotResp(_) | Message::Ok | Message::Error(_) => {
+        Message::SnapshotResp(_)
+        | Message::Ok
+        | Message::Error(_)
+        | Message::BatchResult { .. }
+        | Message::SignatureResp { .. } => {
             writer.send_error("Unexpected message type")?;
+            Ok(BatchResponse::Normal)
         }
     }
-
-    Ok(())
 }
 
 fn scan_directory(root: &PathBuf) -> Result<Snapshot> {

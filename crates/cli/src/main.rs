@@ -9,7 +9,7 @@
 
 mod embedded_agents;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -18,10 +18,10 @@ use clap::{Parser, Subcommand, builder::Styles};
 use color_eyre::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
-use zsync_core::{Scanner, Snapshot};
-use zsync_transport::SshTransport;
+use zsync_core::{DeltaComputer, Scanner, Snapshot};
+use zsync_transport::{AgentSession, SshTransport};
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -180,6 +180,83 @@ fn scan_command(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Threshold for using delta transfers (files larger than this use delta)
+const DELTA_THRESHOLD: u64 = 32 * 1024; // 32KB
+
+/// Prepare a file for transfer, using delta if beneficial
+async fn prepare_transfer(
+    local: &Path,
+    path: &Path,
+    remote_snapshot: &Snapshot,
+    agent: &mut AgentSession,
+    executable: bool,
+) -> Result<TransferData> {
+    let full_path = local.join(path);
+    let local_data = std::fs::read(&full_path)?;
+
+    // Check if file exists on remote and is large enough for delta
+    if let Some(remote_entry) = remote_snapshot.files.get(path) {
+        if remote_entry.size >= DELTA_THRESHOLD && local_data.len() as u64 >= DELTA_THRESHOLD {
+            // Try delta transfer
+            match agent.get_signature(path).await {
+                Ok(sig_data) => {
+                    let sig = DeltaComputer::decompress_signature(&sig_data)?;
+                    let computer = DeltaComputer::new();
+                    let delta = computer.delta(&local_data, &sig);
+                    let compressed_delta = DeltaComputer::compress_delta(&delta)?;
+
+                    // Only use delta if it's significantly smaller
+                    if compressed_delta.len() < local_data.len() / 2 {
+                        debug!(
+                            "Using delta for {} ({} -> {} bytes, {:.1}% reduction)",
+                            path.display(),
+                            local_data.len(),
+                            compressed_delta.len(),
+                            (1.0 - compressed_delta.len() as f64 / local_data.len() as f64) * 100.0
+                        );
+                        return Ok(TransferData::Delta {
+                            data: compressed_delta,
+                            executable,
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Delta transfer failed for {}, using full: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // Fall back to full file transfer with compression
+    let compressed = zstd::encode_all(local_data.as_slice(), 3)?;
+    if compressed.len() < local_data.len() {
+        debug!(
+            "Compressed {} ({} -> {} bytes)",
+            path.display(),
+            local_data.len(),
+            compressed.len()
+        );
+        Ok(TransferData::CompressedFull {
+            data: local_data,
+            executable,
+        })
+    } else {
+        Ok(TransferData::Full {
+            data: local_data,
+            executable,
+        })
+    }
+}
+
+enum TransferData {
+    Full { data: Vec<u8>, executable: bool },
+    CompressedFull { data: Vec<u8>, executable: bool },
+    Delta { data: Vec<u8>, executable: bool },
+}
+
 async fn sync_command(
     local: &PathBuf,
     remote: &str,
@@ -238,45 +315,121 @@ async fn sync_command(
         info!("Already in sync!");
     } else {
         info!(
-            "Changes: {} added, {} modified, {} deleted",
+            "Changes: {} added, {} modified, {} removed",
             diff.added.len(),
             diff.modified.len(),
             deletions
         );
 
-        // Transfer added and modified files
-        let to_transfer: Vec<_> = diff.added.iter().chain(diff.modified.iter()).collect();
+        // Collect all files to transfer
+        let added: Vec<_> = diff.added.iter().collect();
+        let modified: Vec<_> = diff.modified.iter().collect();
+        let to_delete: Vec<_> = if no_delete {
+            vec![]
+        } else {
+            diff.removed.iter().collect()
+        };
 
-        for (i, path) in to_transfer.iter().enumerate() {
-            let entry = local_snapshot
-                .files
-                .get(*path)
-                .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+        let total_ops = added.len() + modified.len() + to_delete.len();
 
-            let full_path = local.join(path);
-            let data = std::fs::read(&full_path)?;
+        if total_ops > 0 {
+            // Prepare transfer data (delta for modified files where beneficial)
+            let mut transfers: Vec<(&Path, TransferData)> = Vec::new();
+            let mut total_bytes = 0u64;
+            let mut delta_count = 0usize;
 
+            // Added files - always full transfer
+            for path in &added {
+                let entry = local_snapshot
+                    .files
+                    .get(*path)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+                let full_path = local.join(path);
+                let data = std::fs::read(&full_path)?;
+                total_bytes += data.len() as u64;
+                transfers.push((
+                    path,
+                    TransferData::Full {
+                        data,
+                        executable: entry.executable,
+                    },
+                ));
+            }
+
+            // Modified files - try delta transfer
+            for path in &modified {
+                let entry = local_snapshot
+                    .files
+                    .get(*path)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+                let transfer =
+                    prepare_transfer(local, path, &remote_snapshot, &mut agent, entry.executable)
+                        .await?;
+                match &transfer {
+                    TransferData::Delta { data, .. } => {
+                        delta_count += 1;
+                        total_bytes += data.len() as u64;
+                    }
+                    TransferData::Full { data, .. } | TransferData::CompressedFull { data, .. } => {
+                        total_bytes += data.len() as u64;
+                    }
+                }
+                transfers.push((path, transfer));
+            }
+
+            if delta_count > 0 {
+                info!("Using delta transfer for {delta_count} modified files");
+            }
+
+            // Start batch mode for pipelining
             info!(
-                "[{}/{}] Uploading {} ({} bytes)",
-                i + 1,
-                to_transfer.len(),
-                path.display(),
-                data.len()
+                "Transferring {} bytes in {} operations (pipelined)...",
+                total_bytes, total_ops
             );
+            agent.start_batch(total_ops as u32).await?;
 
-            agent.write_file(path, &data, entry.executable).await?;
-        }
-
-        // Delete removed files (unless --no-delete)
-        if !no_delete {
-            for (i, path) in diff.removed.iter().enumerate() {
-                info!(
-                    "[{}/{}] Deleting {}",
+            // Queue all writes
+            for (i, (path, transfer)) in transfers.iter().enumerate() {
+                debug!(
+                    "[{}/{}] Queueing {}",
                     i + 1,
-                    diff.removed.len(),
+                    transfers.len(),
                     path.display()
                 );
-                agent.delete_file(path).await?;
+                match transfer {
+                    TransferData::Full { data, executable }
+                    | TransferData::CompressedFull { data, executable } => {
+                        agent.queue_write_file(path, data, *executable).await?;
+                    }
+                    TransferData::Delta { data, executable } => {
+                        agent.queue_write_delta(path, data, *executable).await?;
+                    }
+                }
+            }
+
+            // Queue all deletes
+            for path in &to_delete {
+                debug!("Queueing delete: {}", path.display());
+                agent.queue_delete_file(path).await?;
+            }
+
+            // End batch and get results
+            let result = agent.end_batch().await?;
+
+            if result.errors.is_empty() {
+                info!(
+                    "Batch complete: {} operations successful",
+                    result.success_count
+                );
+            } else {
+                warn!(
+                    "Batch complete: {} successful, {} failed",
+                    result.success_count,
+                    result.errors.len()
+                );
+                for (idx, msg) in &result.errors {
+                    error!("  Operation {idx}: {msg}");
+                }
             }
         }
     }

@@ -37,6 +37,14 @@ pub mod msg {
     pub const OK: u8 = 0x05;
     pub const ERROR: u8 = 0x06;
     pub const SHUTDOWN: u8 = 0x07;
+    // New pipelined batch operations
+    pub const BATCH_START: u8 = 0x10;
+    pub const BATCH_END: u8 = 0x11;
+    pub const BATCH_RESULT: u8 = 0x12;
+    // Delta transfer operations
+    pub const SIGNATURE_REQ: u8 = 0x20;
+    pub const SIGNATURE_RESP: u8 = 0x21;
+    pub const WRITE_DELTA: u8 = 0x22;
 }
 
 /// Write a frame header (type + length)
@@ -152,6 +160,133 @@ impl<W: Write> ProtocolWriter<W> {
         Ok(())
     }
 
+    /// Send batch start (pipelining)
+    pub fn send_batch_start(&mut self, count: u32) -> Result<()> {
+        write_header(&mut self.inner, msg::BATCH_START, 4)?;
+        self.inner.write_all(&count.to_be_bytes())?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send batch end
+    pub fn send_batch_end(&mut self) -> Result<()> {
+        write_header(&mut self.inner, msg::BATCH_END, 0)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send batch result
+    pub fn send_batch_result(
+        &mut self,
+        success_count: u32,
+        errors: &[(u32, String)],
+    ) -> Result<()> {
+        // Format: success_count(4) + error_count(4) + errors...
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&success_count.to_be_bytes());
+        payload.extend_from_slice(&(errors.len() as u32).to_be_bytes());
+        for (idx, msg) in errors {
+            payload.extend_from_slice(&idx.to_be_bytes());
+            let msg_bytes = msg.as_bytes();
+            payload.extend_from_slice(&(msg_bytes.len() as u16).to_be_bytes());
+            payload.extend_from_slice(msg_bytes);
+        }
+        write_header(&mut self.inner, msg::BATCH_RESULT, payload.len() as u32)?;
+        self.inner.write_all(&payload)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send signature request for delta transfer
+    pub fn send_signature_req(&mut self, path: &Path) -> Result<()> {
+        let path_encoded = encode_path(path);
+        write_header(
+            &mut self.inner,
+            msg::SIGNATURE_REQ,
+            path_encoded.len() as u32,
+        )?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send signature response
+    pub fn send_signature_resp(&mut self, path: &Path, signature: &[u8]) -> Result<()> {
+        let path_encoded = encode_path(path);
+        let payload_len = path_encoded.len() + 4 + signature.len();
+        write_header(&mut self.inner, msg::SIGNATURE_RESP, payload_len as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner
+            .write_all(&(signature.len() as u32).to_be_bytes())?;
+        self.inner.write_all(signature)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send delta write (compressed delta data)
+    pub fn send_write_delta(&mut self, path: &Path, delta: &[u8], executable: bool) -> Result<()> {
+        let path_encoded = encode_path(path);
+        let payload_len = path_encoded.len() + 1 + 4 + delta.len();
+        write_header(&mut self.inner, msg::WRITE_DELTA, payload_len as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&(delta.len() as u32).to_be_bytes())?;
+        self.inner.write_all(delta)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send write file without flushing (for batch operations)
+    pub fn send_write_file_no_flush(
+        &mut self,
+        path: &Path,
+        data: &[u8],
+        executable: bool,
+    ) -> Result<()> {
+        let path_encoded = encode_path(path);
+        let payload_len = path_encoded.len() + 1 + data.len();
+
+        write_header(&mut self.inner, msg::WRITE_FILE, payload_len as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(data)?;
+        // No flush - caller will flush after batch
+        Ok(())
+    }
+
+    /// Send delete file without flushing (for batch operations)
+    pub fn send_delete_file_no_flush(&mut self, path: &Path) -> Result<()> {
+        let path_encoded = encode_path(path);
+        write_header(&mut self.inner, msg::DELETE_FILE, path_encoded.len() as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        // No flush - caller will flush after batch
+        Ok(())
+    }
+
+    /// Send write delta without flushing (for batch operations)
+    pub fn send_write_delta_no_flush(
+        &mut self,
+        path: &Path,
+        delta: &[u8],
+        executable: bool,
+    ) -> Result<()> {
+        let path_encoded = encode_path(path);
+        let payload_len = path_encoded.len() + 1 + 4 + delta.len();
+        write_header(&mut self.inner, msg::WRITE_DELTA, payload_len as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&(delta.len() as u32).to_be_bytes())?;
+        self.inner.write_all(delta)?;
+        // No flush
+        Ok(())
+    }
+
+    /// Flush the underlying writer
+    pub fn flush(&mut self) -> Result<()> {
+        self.inner.flush()?;
+        Ok(())
+    }
+
     /// Get inner writer
     pub fn into_inner(self) -> W {
         self.inner
@@ -174,6 +309,33 @@ pub enum Message {
     Ok,
     Error(String),
     Shutdown,
+    // Batch operations (pipelining)
+    BatchStart {
+        /// Number of operations in this batch
+        count: u32,
+    },
+    BatchEnd,
+    BatchResult {
+        /// Number of successful operations
+        success_count: u32,
+        /// Errors (index, message) for failed operations
+        errors: Vec<(u32, String)>,
+    },
+    // Delta operations
+    SignatureReq {
+        path: PathBuf,
+    },
+    SignatureResp {
+        path: PathBuf,
+        /// Compressed signature data
+        signature: Vec<u8>,
+    },
+    WriteDelta {
+        path: PathBuf,
+        /// Compressed delta data
+        delta: Vec<u8>,
+        executable: bool,
+    },
 }
 
 /// Protocol reader for receiving messages
@@ -235,6 +397,85 @@ impl<R: Read> ProtocolReader<R> {
             }
 
             msg::SHUTDOWN => Ok(Message::Shutdown),
+
+            msg::BATCH_START => {
+                let mut count_buf = [0u8; 4];
+                self.inner.read_exact(&mut count_buf)?;
+                Ok(Message::BatchStart {
+                    count: u32::from_be_bytes(count_buf),
+                })
+            }
+
+            msg::BATCH_END => Ok(Message::BatchEnd),
+
+            msg::BATCH_RESULT => {
+                let mut success_buf = [0u8; 4];
+                self.inner.read_exact(&mut success_buf)?;
+                let success_count = u32::from_be_bytes(success_buf);
+
+                let mut error_count_buf = [0u8; 4];
+                self.inner.read_exact(&mut error_count_buf)?;
+                let error_count = u32::from_be_bytes(error_count_buf) as usize;
+
+                let mut errors = Vec::with_capacity(error_count);
+                for _ in 0..error_count {
+                    let mut idx_buf = [0u8; 4];
+                    self.inner.read_exact(&mut idx_buf)?;
+                    let idx = u32::from_be_bytes(idx_buf);
+
+                    let mut msg_len_buf = [0u8; 2];
+                    self.inner.read_exact(&mut msg_len_buf)?;
+                    let msg_len = u16::from_be_bytes(msg_len_buf) as usize;
+
+                    let mut msg_buf = vec![0u8; msg_len];
+                    self.inner.read_exact(&mut msg_buf)?;
+                    let msg = String::from_utf8_lossy(&msg_buf).to_string();
+
+                    errors.push((idx, msg));
+                }
+
+                Ok(Message::BatchResult {
+                    success_count,
+                    errors,
+                })
+            }
+
+            msg::SIGNATURE_REQ => {
+                let path = decode_path(&mut self.inner)?;
+                Ok(Message::SignatureReq { path })
+            }
+
+            msg::SIGNATURE_RESP => {
+                let path = decode_path(&mut self.inner)?;
+                let mut sig_len_buf = [0u8; 4];
+                self.inner.read_exact(&mut sig_len_buf)?;
+                let sig_len = u32::from_be_bytes(sig_len_buf) as usize;
+
+                let mut signature = vec![0u8; sig_len];
+                self.inner.read_exact(&mut signature)?;
+
+                Ok(Message::SignatureResp { path, signature })
+            }
+
+            msg::WRITE_DELTA => {
+                let path = decode_path(&mut self.inner)?;
+                let mut exec_buf = [0u8; 1];
+                self.inner.read_exact(&mut exec_buf)?;
+                let executable = exec_buf[0] != 0;
+
+                let mut delta_len_buf = [0u8; 4];
+                self.inner.read_exact(&mut delta_len_buf)?;
+                let delta_len = u32::from_be_bytes(delta_len_buf) as usize;
+
+                let mut delta = vec![0u8; delta_len];
+                self.inner.read_exact(&mut delta)?;
+
+                Ok(Message::WriteDelta {
+                    path,
+                    delta,
+                    executable,
+                })
+            }
 
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }
