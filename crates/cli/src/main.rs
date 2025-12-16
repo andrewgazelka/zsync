@@ -296,12 +296,22 @@ async fn sync_once(
         deletions
     );
 
-    // Print individual file changes
+    // Print individual file changes with sizes
     for path in &diff.added {
-        info!("  + {}", path.display());
+        let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+        info!(
+            "  + {} ({})",
+            path.display(),
+            humansize::format_size(size, humansize::BINARY)
+        );
     }
     for path in &diff.modified {
-        info!("  ~ {}", path.display());
+        let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+        info!(
+            "  ~ {} ({})",
+            path.display(),
+            humansize::format_size(size, humansize::BINARY)
+        );
     }
     if !no_delete {
         for path in &diff.removed {
@@ -495,10 +505,20 @@ async fn sync_command(
         );
 
         for path in &diff.added {
-            info!("  + {}", path.display());
+            let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+            info!(
+                "  + {} ({})",
+                path.display(),
+                humansize::format_size(size, humansize::BINARY)
+            );
         }
         for path in &diff.modified {
-            info!("  ~ {}", path.display());
+            let size = local_snapshot.files.get(path).map(|e| e.size).unwrap_or(0);
+            info!(
+                "  ~ {} ({})",
+                path.display(),
+                humansize::format_size(size, humansize::BINARY)
+            );
         }
         if !no_delete {
             for path in &diff.removed {
