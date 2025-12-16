@@ -321,6 +321,19 @@ async fn sync_command(
             deletions
         );
 
+        // Print individual file changes
+        for path in &diff.added {
+            info!("  + {}", path.display());
+        }
+        for path in &diff.modified {
+            info!("  ~ {}", path.display());
+        }
+        if !no_delete {
+            for path in &diff.removed {
+                info!("  - {}", path.display());
+            }
+        }
+
         // Collect all files to transfer
         let added: Vec<_> = diff.added.iter().collect();
         let modified: Vec<_> = diff.modified.iter().collect();
