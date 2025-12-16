@@ -123,7 +123,10 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
         stdout.flush()?;
 
         if matches!(response, Response::Ok)
-            && matches!(serde_json::from_str::<Request>(&line), Ok(Request::Shutdown))
+            && matches!(
+                serde_json::from_str::<Request>(&line),
+                Ok(Request::Shutdown)
+            )
         {
             break;
         }
@@ -223,7 +226,6 @@ fn apply_delta(path: &PathBuf, delta_json: &str) -> Result<()> {
 
 fn base64_decode_and_write(path: &PathBuf, data: &str) -> Result<()> {
     // Simple base64 decode (in production, use a proper base64 crate)
-    
 
     // Create parent directory if needed
     if let Some(parent) = path.parent() {

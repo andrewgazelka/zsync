@@ -11,8 +11,8 @@ use crate::Platform;
 /// At build time, cross-compiled agent binaries are embedded into the CLI.
 /// At runtime, the appropriate binary is extracted and deployed to the remote host.
 pub struct AgentBundle {
-    /// Compressed agent binaries by platform
-    binaries: HashMap<Platform, Vec<u8>>,
+    /// Agent binaries by platform
+    binaries: HashMap<Platform, &'static [u8]>,
 }
 
 impl AgentBundle {
@@ -25,14 +25,14 @@ impl AgentBundle {
     }
 
     /// Add a binary for a platform
-    pub fn add(&mut self, platform: Platform, data: Vec<u8>) {
+    pub fn add(&mut self, platform: Platform, data: &'static [u8]) {
         self.binaries.insert(platform, data);
     }
 
-    /// Get binary for a platform (decompressed)
+    /// Get binary for a platform
     #[must_use]
     pub fn get(&self, platform: Platform) -> Option<&[u8]> {
-        self.binaries.get(&platform).map(Vec::as_slice)
+        self.binaries.get(&platform).copied()
     }
 
     /// Check if a platform is available
@@ -47,27 +47,12 @@ impl AgentBundle {
         self.binaries.keys().copied().collect()
     }
 
-    /// Load embedded agent binaries
-    ///
-    /// In a real build, this would use `include_bytes!` or `include_dir!`
-    /// to embed cross-compiled binaries.
-    #[must_use]
-    pub fn embedded() -> Self {
-        // In production, these would be embedded at compile time:
-        // bundle.add(Platform::LinuxX86_64, include_bytes!("../agents/linux-x86_64.zst").to_vec());
-        // bundle.add(Platform::LinuxAarch64, include_bytes!("../agents/linux-aarch64.zst").to_vec());
-        // etc.
-
-        // For now, return empty bundle (agent must be built separately)
-        Self::new()
-    }
-
     /// Load agent binaries from a directory (for development)
     ///
     /// # Errors
     /// Returns an error if reading files fails
     pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
-        let mut bundle = Self::new();
+        let mut owned = OwnedAgentBundle::new();
 
         let platforms = [
             (Platform::LinuxX86_64, "linux-x86_64"),
@@ -81,18 +66,45 @@ impl AgentBundle {
             if path.exists() {
                 let data = std::fs::read(&path)?;
                 let len = data.len();
-                bundle.add(platform, data);
+                owned.add(platform, data);
                 tracing::debug!("Loaded agent for {suffix} ({len} bytes)");
             }
         }
 
-        Ok(bundle)
+        Ok(owned.into_static())
     }
 }
 
 impl Default for AgentBundle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Owned version for loading from disk
+struct OwnedAgentBundle {
+    binaries: HashMap<Platform, Vec<u8>>,
+}
+
+impl OwnedAgentBundle {
+    fn new() -> Self {
+        Self {
+            binaries: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, platform: Platform, data: Vec<u8>) {
+        self.binaries.insert(platform, data);
+    }
+
+    fn into_static(self) -> AgentBundle {
+        let mut bundle = AgentBundle::new();
+        for (platform, data) in self.binaries {
+            // Leak the Vec to get a 'static slice - fine for CLI lifetime
+            let static_data: &'static [u8] = Box::leak(data.into_boxed_slice());
+            bundle.add(platform, static_data);
+        }
+        bundle
     }
 }
 
@@ -103,7 +115,8 @@ mod tests {
     #[test]
     fn test_bundle_add_get() {
         let mut bundle = AgentBundle::new();
-        bundle.add(Platform::LinuxX86_64, vec![1, 2, 3]);
+        static TEST_DATA: &[u8] = &[1, 2, 3];
+        bundle.add(Platform::LinuxX86_64, TEST_DATA);
 
         assert!(bundle.has(Platform::LinuxX86_64));
         assert!(!bundle.has(Platform::LinuxAarch64));

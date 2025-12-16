@@ -19,10 +19,7 @@ impl Snapshot {
     /// Create a snapshot from scanned entries
     #[must_use]
     pub fn from_entries(entries: Vec<FileEntry>) -> Self {
-        let files = entries
-            .into_iter()
-            .map(|e| (e.path.clone(), e))
-            .collect();
+        let files = entries.into_iter().map(|e| (e.path.clone(), e)).collect();
         Self { files }
     }
 
@@ -134,10 +131,8 @@ mod tests {
     #[test]
     fn test_snapshot_diff_added() {
         let old = Snapshot::from_entries(vec![make_entry("a.txt", b"a")]);
-        let new = Snapshot::from_entries(vec![
-            make_entry("a.txt", b"a"),
-            make_entry("b.txt", b"b"),
-        ]);
+        let new =
+            Snapshot::from_entries(vec![make_entry("a.txt", b"a"), make_entry("b.txt", b"b")]);
 
         let diff = old.diff(&new);
         assert_eq!(diff.added, vec![PathBuf::from("b.txt")]);
@@ -147,10 +142,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_diff_removed() {
-        let old = Snapshot::from_entries(vec![
-            make_entry("a.txt", b"a"),
-            make_entry("b.txt", b"b"),
-        ]);
+        let old =
+            Snapshot::from_entries(vec![make_entry("a.txt", b"a"), make_entry("b.txt", b"b")]);
         let new = Snapshot::from_entries(vec![make_entry("a.txt", b"a")]);
 
         let diff = old.diff(&new);

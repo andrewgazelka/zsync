@@ -9,8 +9,8 @@ use color_eyre::Result;
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
 
-use crate::agent::AgentBundle;
 use crate::Platform;
+use crate::agent::AgentBundle;
 
 /// SSH transport for communicating with remote hosts
 pub struct SshTransport {
@@ -110,7 +110,9 @@ impl SshTransport {
         let remote_path = format!("{remote_dir}/zsync-agent");
 
         // Check if agent already exists
-        let (stdout, _, _exit) = self.execute(&format!("test -x ~/{remote_path} && echo exists")).await?;
+        let (stdout, _, _exit) = self
+            .execute(&format!("test -x ~/{remote_path} && echo exists"))
+            .await?;
 
         if stdout.contains("exists") {
             debug!("Agent already deployed at ~/{remote_path}");

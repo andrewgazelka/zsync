@@ -174,9 +174,18 @@ mod tests {
 
         // Should have .gitignore and keep.txt, but not ignore.log
         let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
-        assert!(paths.contains(&PathBuf::from("keep.txt")), "paths: {paths:?}");
-        assert!(paths.contains(&PathBuf::from(".gitignore")), "paths: {paths:?}");
-        assert!(!paths.contains(&PathBuf::from("ignore.log")), "paths: {paths:?}");
+        assert!(
+            paths.contains(&PathBuf::from("keep.txt")),
+            "paths: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from(".gitignore")),
+            "paths: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&PathBuf::from("ignore.log")),
+            "paths: {paths:?}"
+        );
     }
 
     #[test]

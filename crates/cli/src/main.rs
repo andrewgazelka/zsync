@@ -7,6 +7,8 @@
 //! - Pure Rust SSH transport
 //! - File watching with debouncing
 
+mod embedded_agents;
+
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,11 +16,11 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tracing::{debug, error, info, warn};
 
 use zsync_core::{Scanner, Snapshot};
-use zsync_transport::{AgentBundle, SshTransport};
+use zsync_transport::SshTransport;
 
 #[derive(Parser)]
 #[command(name = "zsync")]
@@ -173,7 +175,13 @@ fn scan_command(path: &PathBuf, format: &str) -> Result<()> {
 async fn sync_command(local: &PathBuf, remote: &str, port: u16) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
-    info!("Syncing {} -> {}@{}:{}", local.display(), user, host, remote_path);
+    info!(
+        "Syncing {} -> {}@{}:{}",
+        local.display(),
+        user,
+        host,
+        remote_path
+    );
 
     // Scan local
     info!("Scanning local directory...");
@@ -187,7 +195,7 @@ async fn sync_command(local: &PathBuf, remote: &str, port: u16) -> Result<()> {
     let mut transport = SshTransport::connect(&host, port, &user).await?;
 
     // Deploy agent
-    let bundle = AgentBundle::embedded();
+    let bundle = embedded_agents::embedded_bundle();
     if bundle.platforms().is_empty() {
         warn!("No embedded agent binaries - remote must have zsync-agent installed");
     } else {
@@ -238,10 +246,7 @@ async fn watch_command(local: &PathBuf, remote: &str, port: u16, debounce_ms: u6
     loop {
         match rx.recv() {
             Ok(events) => {
-                let paths: Vec<_> = events
-                    .iter()
-                    .flat_map(|e| e.paths.iter())
-                    .collect();
+                let paths: Vec<_> = events.iter().flat_map(|e| e.paths.iter()).collect();
 
                 if paths.is_empty() {
                     continue;
@@ -270,16 +275,16 @@ async fn watch_command(local: &PathBuf, remote: &str, port: u16, debounce_ms: u6
 /// Parse remote string like "user@host:/path" into components
 fn parse_remote(remote: &str) -> Result<(String, String, String)> {
     // Format: user@host:/path or user@host:path
-    let at_pos = remote
-        .find('@')
-        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path"))?;
+    let at_pos = remote.find('@').ok_or_else(|| {
+        color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path")
+    })?;
 
     let user = remote[..at_pos].to_string();
     let rest = &remote[at_pos + 1..];
 
-    let colon_pos = rest
-        .find(':')
-        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path"))?;
+    let colon_pos = rest.find(':').ok_or_else(|| {
+        color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path")
+    })?;
 
     let host = rest[..colon_pos].to_string();
     let path = rest[colon_pos + 1..].to_string();
