@@ -20,7 +20,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tracing::{debug, error, info, warn};
 
-use zsync_core::{DeltaComputer, Scanner, Snapshot};
+use zsync_core::{DeltaComputer, Scanner, Snapshot, ZsyncConfig};
 use zsync_transport::{AgentSession, SshTransport};
 
 const STYLES: Styles = Styles::styled()
@@ -74,6 +74,32 @@ enum Commands {
         include: Vec<String>,
 
         /// Don't delete remote files that don't exist locally
+        #[arg(long)]
+        no_delete: bool,
+
+        /// Show what would be synced without actually syncing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show sync status without making changes (alias for sync --dry-run)
+    Status {
+        /// Remote destination (user@host:/path)
+        remote: String,
+
+        /// Local directory path
+        #[arg(default_value = ".")]
+        local: PathBuf,
+
+        /// SSH port
+        #[arg(short, long, default_value = "22")]
+        port: u16,
+
+        /// Force-include files even if gitignored (e.g., .env)
+        #[arg(short, long)]
+        include: Vec<String>,
+
+        /// Don't consider remote-only files as "to be deleted"
         #[arg(long)]
         no_delete: bool,
     },
@@ -141,8 +167,19 @@ async fn main() -> Result<()> {
             port,
             include,
             no_delete,
+            dry_run,
         } => {
-            sync_command(&local, &remote, port, &include, no_delete).await?;
+            sync_command(&local, &remote, port, &include, no_delete, dry_run).await?;
+        }
+        Commands::Status {
+            local,
+            remote,
+            port,
+            include,
+            no_delete,
+        } => {
+            // Status is just sync --dry-run
+            sync_command(&local, &remote, port, &include, no_delete, true).await?;
         }
         Commands::Watch {
             local,
@@ -276,6 +313,14 @@ async fn sync_once(
     let local_snapshot = Snapshot::from_entries(entries);
     debug!("Found {} local files", local_snapshot.len());
 
+    // Warn if local directory appears empty
+    if local_snapshot.is_empty() {
+        warn!(
+            "Local directory '{}' contains no files (after .gitignore filtering)",
+            local.display()
+        );
+    }
+
     // Get remote snapshot
     debug!("Getting remote snapshot...");
     let remote_snapshot = agent.snapshot().await?;
@@ -287,6 +332,11 @@ async fn sync_once(
     let deletions = if no_delete { 0 } else { diff.removed.len() };
 
     if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
+        debug!(
+            "Already in sync ({} local, {} remote)",
+            local_snapshot.len(),
+            remote_snapshot.len()
+        );
         return Ok(false);
     }
 
@@ -465,16 +515,27 @@ async fn sync_command(
     port: u16,
     includes: &[String],
     no_delete: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
-    info!(
-        "Syncing {} -> {}@{}:{}",
-        local.display(),
-        user,
-        host,
-        remote_path
-    );
+    if dry_run {
+        info!(
+            "Checking {} -> {}@{}:{} (dry-run, no changes will be made)",
+            local.display(),
+            user,
+            host,
+            remote_path
+        );
+    } else {
+        info!(
+            "Syncing {} -> {}@{}:{}",
+            local.display(),
+            user,
+            host,
+            remote_path
+        );
+    }
 
     info!("Scanning local directory...");
     let mut scanner = Scanner::new(local);
@@ -484,6 +545,15 @@ async fn sync_command(
     let entries = scanner.scan()?;
     let local_snapshot = Snapshot::from_entries(entries);
     info!("Found {} local files", local_snapshot.len());
+
+    // Warn if local directory appears empty - might indicate wrong path or overly aggressive gitignore
+    if local_snapshot.is_empty() {
+        warn!(
+            "Local directory '{}' contains no files (after .gitignore filtering). \
+             Check that this is the correct path and that your files aren't all gitignored.",
+            local.display()
+        );
+    }
 
     let (_transport, mut agent) = connect_and_start_agent(&host, port, &user, &remote_path).await?;
 
@@ -496,7 +566,16 @@ async fn sync_command(
     let deletions = if no_delete { 0 } else { diff.removed.len() };
 
     if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
-        info!("Already in sync!");
+        info!(
+            "Already in sync! ({} local files, {} remote files)",
+            local_snapshot.len(),
+            remote_snapshot.len()
+        );
+        // Show sample matching files in debug mode
+        if !local_snapshot.files.is_empty() {
+            let sample: Vec<_> = local_snapshot.files.keys().take(3).collect();
+            debug!("Sample matching files: {:?}", sample);
+        }
     } else {
         info!(
             "Changes: {} added, {} modified, {} removed",
@@ -525,6 +604,13 @@ async fn sync_command(
             for path in &diff.removed {
                 info!("  - {}", path.display());
             }
+        }
+
+        // In dry-run mode, just show what would be done and exit
+        if dry_run {
+            info!("Dry-run complete. Use 'zsync sync' without --dry-run to apply changes.");
+            agent.shutdown().await?;
+            return Ok(());
         }
 
         let added: Vec<_> = diff.added.iter().collect();
@@ -648,6 +734,17 @@ async fn watch_command(
 ) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
+    // Load .zsync.toml config
+    let config = ZsyncConfig::load(local)?;
+
+    // Merge includes from config and CLI args
+    let mut all_includes: Vec<String> = config.include.clone();
+    for inc in includes {
+        if !all_includes.contains(inc) {
+            all_includes.push(inc.clone());
+        }
+    }
+
     info!(
         "Watching {} -> {}@{}:{}",
         local.display(),
@@ -660,9 +757,22 @@ async fn watch_command(
     let (mut transport, mut agent) =
         connect_and_start_agent(&host, port, &user, &remote_path).await?;
 
+    // Start port forwards from config
+    let mut forward_handles = Vec::new();
+    for fwd in &config.forward {
+        info!(
+            "Forwarding localhost:{} -> {}:{}",
+            fwd.local, fwd.remote_host, fwd.remote
+        );
+        let handle = transport
+            .forward_port(fwd.local, &fwd.remote_host, fwd.remote)
+            .await?;
+        forward_handles.push(handle);
+    }
+
     // Initial sync
     info!("Initial sync...");
-    match sync_once(local, &mut agent, includes, no_delete).await {
+    match sync_once(local, &mut agent, &all_includes, no_delete).await {
         Ok(true) => info!("Initial sync complete"),
         Ok(false) => info!("Already in sync!"),
         Err(e) => {
@@ -700,7 +810,7 @@ async fn watch_command(
                 debug!("Detected {} changed paths", paths.len());
 
                 // Sync using existing connection
-                match sync_once(local, &mut agent, includes, no_delete).await {
+                match sync_once(local, &mut agent, &all_includes, no_delete).await {
                     Ok(true) => {}  // Changes synced, already logged
                     Ok(false) => {} // No actual changes, stay quiet
                     Err(e) => {
@@ -712,7 +822,7 @@ async fn watch_command(
                                 agent = new_agent;
                                 info!("Reconnected, retrying sync...");
                                 if let Err(e) =
-                                    sync_once(local, &mut agent, includes, no_delete).await
+                                    sync_once(local, &mut agent, &all_includes, no_delete).await
                                 {
                                     error!("Sync failed after reconnect: {e}");
                                 }
@@ -731,6 +841,10 @@ async fn watch_command(
         }
     }
 
+    // Abort port forward tasks
+    for handle in forward_handles {
+        handle.abort();
+    }
     drop(transport); // Explicit drop to silence unused warning
     agent.shutdown().await?;
     Ok(())

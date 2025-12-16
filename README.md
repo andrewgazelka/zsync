@@ -90,6 +90,36 @@ No `apt install`. No version conflicts. No "rsync: command not found".
 - Any Linux server with SSH access (x86_64, aarch64)
 - Works on minimal containers, VMs, cloud instances — anywhere with SSH
 
+## Configuration
+
+Create a `.zsync.toml` in your project root for advanced settings:
+
+```toml
+# Include files even if they're gitignored
+include = [".env", "secrets/config.yaml"]
+
+# Port forwarding (active during watch mode)
+[[forward]]
+local = 8080    # Listen on localhost:8080
+remote = 8080   # Forward to remote:8080
+
+[[forward]]
+local = 3000
+remote = 3000
+remote_host = "api-server"  # Forward to api-server:3000 on the remote
+```
+
+### Port Forwarding
+
+In watch mode, zsync can forward local ports to the remote machine through the SSH connection:
+
+```bash
+zsync watch ./project user@server:/workspace
+# Output: Forwarding localhost:8080 -> localhost:8080
+```
+
+Access remote services at `http://localhost:8080` — no separate SSH tunnel needed.
+
 ## Status
 
 Early development. Core sync and watch mode work. Bidirectional sync coming soon.

@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod chunker;
+pub mod config;
 pub mod delta;
 pub mod hash;
 pub mod protocol;
@@ -12,6 +13,7 @@ pub mod snapshot;
 
 pub use cache::ChunkCache;
 pub use chunker::{Chunk, ChunkConfig};
+pub use config::{PortForward, ZsyncConfig};
 pub use delta::{Delta, DeltaComputer};
 pub use hash::ContentHash;
 pub use protocol::{Message, ProtocolReader, ProtocolWriter};

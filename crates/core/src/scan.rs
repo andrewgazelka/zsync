@@ -10,6 +10,7 @@ use ignore::overrides::OverrideBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::config::ZsyncConfig;
 use crate::hash::ContentHash;
 
 /// Metadata for a single file entry
@@ -36,34 +37,24 @@ pub struct Scanner {
     includes: Vec<String>,
 }
 
-/// Filename for include patterns (like .gitignore but for force-including)
-pub const ZSYNC_INCLUDE_FILE: &str = ".zsyncinclude";
-
 impl Scanner {
     /// Create a new scanner for the given root directory
-    ///
-    /// Automatically loads patterns from `.zsyncinclude` if present.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
-        let mut includes = Vec::new();
-
-        // Load .zsyncinclude if it exists
-        let include_path = root.join(ZSYNC_INCLUDE_FILE);
-        if let Ok(contents) = std::fs::read_to_string(&include_path) {
-            for line in contents.lines() {
-                let line = line.trim();
-                // Skip empty lines and comments
-                if !line.is_empty() && !line.starts_with('#') {
-                    includes.push(line.to_string());
-                }
-            }
-        }
-
         Self {
-            root,
+            root: root.into(),
             extra_ignores: Vec::new(),
-            includes,
+            includes: Vec::new(),
+        }
+    }
+
+    /// Create a new scanner with includes from .zsync.toml config
+    #[must_use]
+    pub fn with_config(root: impl Into<PathBuf>, config: &ZsyncConfig) -> Self {
+        Self {
+            root: root.into(),
+            extra_ignores: Vec::new(),
+            includes: config.include.clone(),
         }
     }
 
@@ -362,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zsyncinclude_file() {
+    fn test_zsync_toml_config() {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join(".gitignore"), ".env\nsecrets/\n").unwrap();
@@ -371,25 +362,28 @@ mod tests {
         fs::write(dir.path().join("secrets/key.pem"), "private").unwrap();
         fs::write(dir.path().join("keep.txt"), "keep").unwrap();
 
-        // Create .zsyncinclude file
+        // Create .zsync.toml config file
         fs::write(
-            dir.path().join(".zsyncinclude"),
-            "# Force include these files\n.env\nsecrets/key.pem\n",
+            dir.path().join(".zsync.toml"),
+            r#"
+include = [".env", "secrets/key.pem"]
+"#,
         )
         .unwrap();
 
-        // Scanner should auto-load .zsyncinclude
-        let scanner = Scanner::new(dir.path());
+        // Load config and create scanner
+        let config = ZsyncConfig::load(dir.path()).unwrap();
+        let scanner = Scanner::with_config(dir.path(), &config);
         let entries = scanner.scan().unwrap();
         let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
 
         assert!(
             paths.contains(&PathBuf::from(".env")),
-            ".env should be included via .zsyncinclude: {paths:?}"
+            ".env should be included via .zsync.toml: {paths:?}"
         );
         assert!(
             paths.contains(&PathBuf::from("secrets/key.pem")),
-            "secrets/key.pem should be included via .zsyncinclude: {paths:?}"
+            "secrets/key.pem should be included via .zsync.toml: {paths:?}"
         );
         assert!(
             paths.contains(&PathBuf::from("keep.txt")),

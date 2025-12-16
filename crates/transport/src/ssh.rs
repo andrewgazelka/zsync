@@ -18,7 +18,7 @@ use zsync_core::{Message, Snapshot, protocol};
 
 /// SSH transport for communicating with remote hosts
 pub struct SshTransport {
-    session: russh::client::Handle<ClientHandler>,
+    session: Arc<russh::client::Handle<ClientHandler>>,
     host: String,
     port: u16,
     user: String,
@@ -531,7 +531,7 @@ impl SshTransport {
         info!("Remote platform: {platform:?}");
 
         Ok(Self {
-            session,
+            session: Arc::new(session),
             host: host.to_string(),
             port,
             user: user.to_string(),
@@ -875,6 +875,57 @@ impl SshTransport {
         })
     }
 
+    /// Start port forwarding from local to remote.
+    ///
+    /// Returns a handle to the background task. The port forwarding runs until
+    /// the task is dropped or the SSH session is closed.
+    ///
+    /// # Arguments
+    /// * `local_port` - Local port to listen on (binds to 127.0.0.1)
+    /// * `remote_host` - Remote host to connect to (usually "localhost")
+    /// * `remote_port` - Remote port to connect to
+    pub async fn forward_port(
+        &self,
+        local_port: u16,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await?;
+        let session = Arc::clone(&self.session);
+        let remote_host = remote_host.to_string();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, addr)) => {
+                        let session = Arc::clone(&session);
+                        let remote_host = remote_host.clone();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_port_forward(
+                                socket,
+                                &session,
+                                &remote_host,
+                                remote_port,
+                                addr,
+                            )
+                            .await
+                            {
+                                debug!("Port forward connection error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        debug!("Port forward listener error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(handle)
+    }
+
     /// Disconnect from the remote host
     pub async fn disconnect(self) -> Result<()> {
         self.session
@@ -882,4 +933,69 @@ impl SshTransport {
             .await?;
         Ok(())
     }
+}
+
+/// Handle a single port-forwarded connection
+async fn handle_port_forward(
+    socket: tokio::net::TcpStream,
+    session: &russh::client::Handle<ClientHandler>,
+    remote_host: &str,
+    remote_port: u16,
+    local_addr: std::net::SocketAddr,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Open SSH direct-tcpip channel to remote
+    let channel = session
+        .channel_open_direct_tcpip(
+            remote_host,
+            u32::from(remote_port),
+            local_addr.ip().to_string(),
+            u32::from(local_addr.port()),
+        )
+        .await?;
+
+    // Convert channel to stream that implements AsyncRead + AsyncWrite
+    let channel_stream = channel.into_stream();
+    let (mut channel_read, mut channel_write) = tokio::io::split(channel_stream);
+    let (mut socket_read, mut socket_write) = socket.into_split();
+
+    // Task: local socket -> SSH channel
+    let write_task = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match socket_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if channel_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = channel_write.shutdown().await;
+    });
+
+    // Task: SSH channel -> local socket
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match channel_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if socket_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = socket_write.shutdown().await;
+    });
+
+    // Wait for both directions to complete
+    let _ = tokio::join!(write_task, read_task);
+
+    Ok(())
 }

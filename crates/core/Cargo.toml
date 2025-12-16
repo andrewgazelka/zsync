@@ -10,6 +10,7 @@ color-eyre.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 ignore.workspace = true
 blake3.workspace = true
 rayon.workspace = true
