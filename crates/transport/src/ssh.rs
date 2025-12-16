@@ -113,6 +113,17 @@ impl AgentSession {
                 let message = String::from_utf8_lossy(&payload).to_string();
                 Ok(Message::Error(message))
             }
+            protocol::msg::BATCH_RESULT => {
+                let (success_count, errors) = decode_batch_result(&payload)?;
+                Ok(Message::BatchResult {
+                    success_count,
+                    errors,
+                })
+            }
+            protocol::msg::SIGNATURE_RESP => {
+                let (path, signature) = decode_signature_resp(&payload)?;
+                Ok(Message::SignatureResp { path, signature })
+            }
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }
     }
@@ -427,6 +438,69 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
     }
 
     Ok(Snapshot::from_entries(entries))
+}
+
+/// Decode batch result from binary
+fn decode_batch_result(data: &[u8]) -> Result<(u32, Vec<(u32, String)>)> {
+    use std::io::{Cursor, Read};
+
+    let mut cursor = Cursor::new(data);
+
+    // Success count
+    let mut success_buf = [0u8; 4];
+    cursor.read_exact(&mut success_buf)?;
+    let success_count = u32::from_be_bytes(success_buf);
+
+    // Error count
+    let mut error_count_buf = [0u8; 4];
+    cursor.read_exact(&mut error_count_buf)?;
+    let error_count = u32::from_be_bytes(error_count_buf) as usize;
+
+    let mut errors = Vec::with_capacity(error_count);
+    for _ in 0..error_count {
+        let mut idx_buf = [0u8; 4];
+        cursor.read_exact(&mut idx_buf)?;
+        let idx = u32::from_be_bytes(idx_buf);
+
+        let mut msg_len_buf = [0u8; 2];
+        cursor.read_exact(&mut msg_len_buf)?;
+        let msg_len = u16::from_be_bytes(msg_len_buf) as usize;
+
+        let mut msg_buf = vec![0u8; msg_len];
+        cursor.read_exact(&mut msg_buf)?;
+        let msg = String::from_utf8_lossy(&msg_buf).to_string();
+
+        errors.push((idx, msg));
+    }
+
+    Ok((success_count, errors))
+}
+
+/// Decode signature response from binary
+fn decode_signature_resp(data: &[u8]) -> Result<(PathBuf, Vec<u8>)> {
+    use std::io::{Cursor, Read};
+
+    let mut cursor = Cursor::new(data);
+
+    // Path
+    let mut path_len_buf = [0u8; 2];
+    cursor.read_exact(&mut path_len_buf)?;
+    let path_len = u16::from_be_bytes(path_len_buf) as usize;
+
+    let mut path_buf = vec![0u8; path_len];
+    cursor.read_exact(&mut path_buf)?;
+    let path = PathBuf::from(String::from_utf8_lossy(&path_buf).to_string());
+
+    // Signature length
+    let mut sig_len_buf = [0u8; 4];
+    cursor.read_exact(&mut sig_len_buf)?;
+    let sig_len = u32::from_be_bytes(sig_len_buf) as usize;
+
+    // Signature data
+    let mut signature = vec![0u8; sig_len];
+    cursor.read_exact(&mut signature)?;
+
+    Ok((path, signature))
 }
 
 /// Parsed SSH config for a specific host (naive parser)
