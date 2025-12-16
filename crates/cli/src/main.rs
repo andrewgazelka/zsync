@@ -72,6 +72,10 @@ enum Commands {
         /// Force-include files even if gitignored (e.g., .env)
         #[arg(short, long)]
         include: Vec<String>,
+
+        /// Don't delete remote files that don't exist locally
+        #[arg(long)]
+        no_delete: bool,
     },
 
     /// Watch and continuously sync changes
@@ -94,6 +98,10 @@ enum Commands {
         /// Force-include files even if gitignored (e.g., .env)
         #[arg(long)]
         include: Vec<String>,
+
+        /// Don't delete remote files that don't exist locally
+        #[arg(long)]
+        no_delete: bool,
     },
 
     /// Scan local directory and print snapshot
@@ -132,8 +140,9 @@ async fn main() -> Result<()> {
             remote,
             port,
             include,
+            no_delete,
         } => {
-            sync_command(&local, &remote, port, &include).await?;
+            sync_command(&local, &remote, port, &include, no_delete).await?;
         }
         Commands::Watch {
             local,
@@ -141,8 +150,9 @@ async fn main() -> Result<()> {
             port,
             debounce,
             include,
+            no_delete,
         } => {
-            watch_command(&local, &remote, port, debounce, &include).await?;
+            watch_command(&local, &remote, port, debounce, &include, no_delete).await?;
         }
     }
 
@@ -170,7 +180,7 @@ fn scan_command(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn sync_command(local: &PathBuf, remote: &str, port: u16, includes: &[String]) -> Result<()> {
+async fn sync_command(local: &PathBuf, remote: &str, port: u16, includes: &[String], no_delete: bool) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
     info!(
@@ -216,14 +226,16 @@ async fn sync_command(local: &PathBuf, remote: &str, port: u16, includes: &[Stri
     // Compute diff
     let diff = remote_snapshot.diff(&local_snapshot);
 
-    if diff.is_empty() {
+    let deletions = if no_delete { 0 } else { diff.removed.len() };
+
+    if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
         info!("Already in sync!");
     } else {
         info!(
             "Changes: {} added, {} modified, {} deleted",
             diff.added.len(),
             diff.modified.len(),
-            diff.removed.len()
+            deletions
         );
 
         // Transfer added and modified files
@@ -249,15 +261,17 @@ async fn sync_command(local: &PathBuf, remote: &str, port: u16, includes: &[Stri
             agent.write_file(path, &data, entry.executable).await?;
         }
 
-        // Delete removed files
-        for (i, path) in diff.removed.iter().enumerate() {
-            info!(
-                "[{}/{}] Deleting {}",
-                i + 1,
-                diff.removed.len(),
-                path.display()
-            );
-            agent.delete_file(path).await?;
+        // Delete removed files (unless --no-delete)
+        if !no_delete {
+            for (i, path) in diff.removed.iter().enumerate() {
+                info!(
+                    "[{}/{}] Deleting {}",
+                    i + 1,
+                    diff.removed.len(),
+                    path.display()
+                );
+                agent.delete_file(path).await?;
+            }
         }
     }
 
@@ -274,6 +288,7 @@ async fn watch_command(
     port: u16,
     debounce_ms: u64,
     includes: &[String],
+    no_delete: bool,
 ) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
@@ -286,7 +301,7 @@ async fn watch_command(
     );
 
     // Initial sync
-    sync_command(local, remote, port, includes).await?;
+    sync_command(local, remote, port, includes, no_delete).await?;
 
     // Setup file watcher
     let (tx, rx) = mpsc::channel();
@@ -318,7 +333,7 @@ async fn watch_command(
                 info!("Detected {} changed paths, syncing...", paths.len());
 
                 // Re-sync
-                if let Err(e) = sync_command(local, remote, port, includes).await {
+                if let Err(e) = sync_command(local, remote, port, includes, no_delete).await {
                     error!("Sync failed: {e}");
                 }
             }
