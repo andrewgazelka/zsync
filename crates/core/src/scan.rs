@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use color_eyre::Result;
+use color_eyre::eyre::WrapErr as _;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::hash::ContentHash;
@@ -119,7 +121,6 @@ impl Scanner {
         }
 
         let matcher = self.include_matcher()?.unwrap();
-        let mut entries = Vec::new();
 
         // Walk without gitignore to find included files
         let mut builder = WalkBuilder::new(&self.root);
@@ -131,40 +132,50 @@ impl Scanner {
             .require_git(false)
             .filter_entry(|e| e.file_name() != ".git");
 
-        for result in builder.build() {
-            let entry = result?;
-            let path = entry.path();
+        // Collect matching file paths first (cheap)
+        let paths: Vec<_> = builder
+            .build()
+            .filter_map(|r| r.ok())
+            .filter_map(|entry| {
+                let path = entry.into_path();
+                if !path.is_file() {
+                    return None;
+                }
+                let relative_path = path.strip_prefix(&self.root).ok()?.to_path_buf();
+                if matcher.matched(&relative_path, false).is_whitelist() {
+                    Some((path, relative_path))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-            if !path.is_file() {
-                continue;
-            }
-
-            let relative_path = path.strip_prefix(&self.root)?.to_path_buf();
-
-            // Only include files matching our include patterns
-            if matcher.matched(&relative_path, false).is_whitelist() {
-                let metadata = std::fs::metadata(path)?;
-                let hash = ContentHash::from_file(path)?;
+        // Hash files in parallel
+        paths
+            .into_par_iter()
+            .map(|(path, relative_path)| {
+                let metadata = std::fs::metadata(&path)
+                    .wrap_err_with(|| format!("failed to read metadata for {path:?}"))?;
+                let hash = ContentHash::from_file(&path)
+                    .wrap_err_with(|| format!("failed to hash {path:?}"))?;
 
                 #[cfg(unix)]
                 let executable = {
-                    use std::os::unix::fs::PermissionsExt;
+                    use std::os::unix::fs::PermissionsExt as _;
                     metadata.permissions().mode() & 0o111 != 0
                 };
                 #[cfg(not(unix))]
                 let executable = false;
 
-                entries.push(FileEntry {
+                Ok(FileEntry {
                     path: relative_path,
                     size: metadata.len(),
                     modified: metadata.modified()?,
                     hash,
                     executable,
-                });
-            }
-        }
-
-        Ok(entries)
+                })
+            })
+            .collect()
     }
 
     /// Scan the directory and return all file entries
@@ -174,43 +185,52 @@ impl Scanner {
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
         use std::collections::HashSet;
 
-        let mut entries = Vec::new();
-        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        // Collect file paths first (cheap directory walk)
+        let paths: Vec<_> = self
+            .walk_builder()
+            .build()
+            .filter_map(|r| r.ok())
+            .filter_map(|entry| {
+                let path = entry.into_path();
+                if !path.is_file() {
+                    return None;
+                }
+                let relative_path = path.strip_prefix(&self.root).ok()?.to_path_buf();
+                Some((path, relative_path))
+            })
+            .collect();
 
-        // First, scan normally (respecting gitignore)
-        for result in self.walk_builder().build() {
-            let entry = result?;
-            let path = entry.path();
+        // Hash files in parallel (expensive I/O + CPU)
+        let mut entries: Vec<FileEntry> = paths
+            .into_par_iter()
+            .map(|(path, relative_path)| {
+                let metadata = std::fs::metadata(&path)
+                    .wrap_err_with(|| format!("failed to read metadata for {path:?}"))?;
+                let hash = ContentHash::from_file(&path)
+                    .wrap_err_with(|| format!("failed to hash {path:?}"))?;
 
-            // Skip directories, only process files
-            if !path.is_file() {
-                continue;
-            }
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    metadata.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = false;
 
-            let metadata = std::fs::metadata(path)?;
-            let relative_path = path.strip_prefix(&self.root)?.to_path_buf();
+                Ok(FileEntry {
+                    path: relative_path,
+                    size: metadata.len(),
+                    modified: metadata.modified()?,
+                    hash,
+                    executable,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            let hash = ContentHash::from_file(path)?;
+        // Build set of seen paths for deduplication
+        let seen_paths: HashSet<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
 
-            #[cfg(unix)]
-            let executable = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
-            };
-            #[cfg(not(unix))]
-            let executable = false;
-
-            seen_paths.insert(relative_path.clone());
-            entries.push(FileEntry {
-                path: relative_path,
-                size: metadata.len(),
-                modified: metadata.modified()?,
-                hash,
-                executable,
-            });
-        }
-
-        // Then, add any force-included files that weren't already found
+        // Add any force-included files that weren't already found
         for included in self.scan_includes()? {
             if !seen_paths.contains(&included.path) {
                 entries.push(included);

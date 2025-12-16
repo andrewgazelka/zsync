@@ -28,6 +28,9 @@ serde_json = "1.0"
 ignore = "0.4"
 walkdir = "2"
 
+# Parallelism
+rayon = "1"
+
 # Hashing
 blake3 = "1"
 crc32fast = "1"
