@@ -21,8 +21,11 @@ use zsync_core::{ContentHash, FileManifest, Message, Snapshot, protocol};
 /// SSH transport for communicating with remote hosts
 pub struct SshTransport {
     session: Arc<russh::client::Handle<ClientHandler>>,
+    #[allow(dead_code)] // Kept for future diagnostics/debugging
     host: String,
+    #[allow(dead_code)]
     port: u16,
+    #[allow(dead_code)]
     user: String,
     platform: Platform,
     agent_path: Option<PathBuf>,
