@@ -370,8 +370,9 @@ async fn sync_once(
 
         // Start batch mode for pipelining
         info!(
-            "Transferring {} bytes in {} operations (pipelined)...",
-            total_bytes, total_ops
+            "Transferring {} in {} operations (pipelined)...",
+            humansize::format_size(total_bytes, humansize::BINARY),
+            total_ops
         );
         agent.start_batch(total_ops as u32).await?;
 
@@ -562,8 +563,9 @@ async fn sync_command(
             }
 
             info!(
-                "Transferring {} bytes in {} operations (pipelined)...",
-                total_bytes, total_ops
+                "Transferring {} in {} operations (pipelined)...",
+                humansize::format_size(total_bytes, humansize::BINARY),
+                total_ops
             );
             agent.start_batch(total_ops as u32).await?;
 
