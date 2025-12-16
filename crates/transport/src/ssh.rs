@@ -12,9 +12,11 @@ use russh::keys::{PublicKey, load_secret_key};
 use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info};
 
+use bytes::Bytes;
+
 use crate::Platform;
 use crate::agent::AgentBundle;
-use zsync_core::{Message, Snapshot, protocol};
+use zsync_core::{ContentHash, FileManifest, Message, Snapshot, protocol};
 
 /// SSH transport for communicating with remote hosts
 pub struct SshTransport {
@@ -123,6 +125,10 @@ impl AgentSession {
             protocol::msg::SIGNATURE_RESP => {
                 let (path, signature) = decode_signature_resp(&payload)?;
                 Ok(Message::SignatureResp { path, signature })
+            }
+            protocol::msg::MISSING_CHUNKS => {
+                let hashes = decode_missing_chunks(&payload)?;
+                Ok(Message::MissingChunks { hashes })
             }
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }
@@ -340,6 +346,84 @@ impl AgentSession {
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
         }
     }
+
+    // ========== CAS (Content-Addressable Storage) Operations ==========
+
+    /// Check which chunks the server is missing
+    pub async fn check_chunks(&mut self, hashes: &[ContentHash]) -> Result<Vec<ContentHash>> {
+        // Build payload: count(4) + hashes(32*count)
+        let payload_len = 4 + hashes.len() * 32;
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::CHECK_CHUNKS);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(hashes.len() as u32).to_be_bytes());
+        for hash in hashes {
+            msg.extend_from_slice(hash.as_bytes());
+        }
+
+        self.send(&msg).await?;
+
+        match self.read_message().await? {
+            Message::MissingChunks { hashes } => Ok(hashes),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Check chunks failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    /// Store chunks on the server
+    pub async fn store_chunks(&mut self, chunks: &[(ContentHash, Bytes)]) -> Result<()> {
+        // Build payload: count(4) + (hash(32) + len(4) + data)*count
+        let payload_len: usize = 4 + chunks
+            .iter()
+            .map(|(_, data)| 32 + 4 + data.len())
+            .sum::<usize>();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::STORE_CHUNKS);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+        for (hash, data) in chunks {
+            msg.extend_from_slice(hash.as_bytes());
+            msg.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            msg.extend_from_slice(data);
+        }
+
+        self.send(&msg).await?;
+
+        match self.read_message().await? {
+            Message::Ok => Ok(()),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Store chunks failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    /// Queue a manifest write in batch mode (no ACK until end_batch)
+    pub async fn queue_write_manifest(
+        &mut self,
+        path: &Path,
+        manifest: &FileManifest,
+        executable: bool,
+    ) -> Result<()> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        // path_len(2) + path + executable(1) + file_hash(32) + size(8) + chunk_count(4) + hashes
+        let payload_len = 2 + path_bytes.len() + 1 + 32 + 8 + 4 + manifest.chunks.len() * 32;
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::WRITE_MANIFEST);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+        msg.push(u8::from(executable));
+        msg.extend_from_slice(manifest.file_hash.as_bytes());
+        msg.extend_from_slice(&manifest.size.to_be_bytes());
+        msg.extend_from_slice(&(manifest.chunks.len() as u32).to_be_bytes());
+        for hash in &manifest.chunks {
+            msg.extend_from_slice(hash.as_bytes());
+        }
+
+        self.send(&msg).await
+    }
 }
 
 /// Result of a batch operation
@@ -501,6 +585,27 @@ fn decode_signature_resp(data: &[u8]) -> Result<(PathBuf, Vec<u8>)> {
     cursor.read_exact(&mut signature)?;
 
     Ok((path, signature))
+}
+
+/// Decode missing chunks response from binary
+fn decode_missing_chunks(data: &[u8]) -> Result<Vec<ContentHash>> {
+    use std::io::{Cursor, Read};
+
+    let mut cursor = Cursor::new(data);
+
+    // Count
+    let mut count_buf = [0u8; 4];
+    cursor.read_exact(&mut count_buf)?;
+    let count = u32::from_be_bytes(count_buf) as usize;
+
+    let mut hashes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut hash_buf = [0u8; 32];
+        cursor.read_exact(&mut hash_buf)?;
+        hashes.push(ContentHash::from_raw(hash_buf));
+    }
+
+    Ok(hashes)
 }
 
 /// Parsed SSH config for a specific host (naive parser)

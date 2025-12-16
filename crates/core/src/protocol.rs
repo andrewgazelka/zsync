@@ -18,15 +18,34 @@
 //! - 0x05: Ok response (no payload)
 //! - 0x06: Error response (message)
 //! - 0x07: Shutdown request (no payload)
+//! - 0x30: CheckChunks (count:4, hashes:[32]*count)
+//! - 0x31: MissingChunks (count:4, hashes:[32]*count)
+//! - 0x32: StoreChunks (count:4, (hash:32, len:4, data)*count)
+//! - 0x33: WriteManifest (path_len:2, path, executable:1, file_hash:32, size:8, chunk_count:4, hashes:[32]*count)
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use color_eyre::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::ContentHash;
 use crate::scan::FileEntry;
 use crate::snapshot::Snapshot;
+
+/// A file represented as a list of content-addressed chunks.
+///
+/// To reconstruct the file: read each chunk from CAS in order, concatenate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileManifest {
+    /// Content hash of the complete file
+    pub file_hash: ContentHash,
+    /// File size in bytes
+    pub size: u64,
+    /// Ordered list of chunk hashes
+    pub chunks: Vec<ContentHash>,
+}
 
 /// Message type identifiers
 pub mod msg {
@@ -37,14 +56,19 @@ pub mod msg {
     pub const OK: u8 = 0x05;
     pub const ERROR: u8 = 0x06;
     pub const SHUTDOWN: u8 = 0x07;
-    // New pipelined batch operations
+    // Pipelined batch operations
     pub const BATCH_START: u8 = 0x10;
     pub const BATCH_END: u8 = 0x11;
     pub const BATCH_RESULT: u8 = 0x12;
-    // Delta transfer operations
+    // Legacy delta transfer operations (deprecated - use CAS instead)
     pub const SIGNATURE_REQ: u8 = 0x20;
     pub const SIGNATURE_RESP: u8 = 0x21;
     pub const WRITE_DELTA: u8 = 0x22;
+    // CAS (Content-Addressable Storage) operations
+    pub const CHECK_CHUNKS: u8 = 0x30;
+    pub const MISSING_CHUNKS: u8 = 0x31;
+    pub const STORE_CHUNKS: u8 = 0x32;
+    pub const WRITE_MANIFEST: u8 = 0x33;
 }
 
 /// Write a frame header (type + length)
@@ -281,6 +305,96 @@ impl<W: Write> ProtocolWriter<W> {
         Ok(())
     }
 
+    // ========== CAS (Content-Addressable Storage) Operations ==========
+
+    /// Send check chunks request - ask server which chunks are missing
+    pub fn send_check_chunks(&mut self, hashes: &[ContentHash]) -> Result<()> {
+        let payload_len = 4 + hashes.len() * 32;
+        write_header(&mut self.inner, msg::CHECK_CHUNKS, payload_len as u32)?;
+        self.inner.write_all(&(hashes.len() as u32).to_be_bytes())?;
+        for hash in hashes {
+            self.inner.write_all(hash.as_bytes())?;
+        }
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send missing chunks response - tells client which chunks to send
+    pub fn send_missing_chunks(&mut self, hashes: &[ContentHash]) -> Result<()> {
+        let payload_len = 4 + hashes.len() * 32;
+        write_header(&mut self.inner, msg::MISSING_CHUNKS, payload_len as u32)?;
+        self.inner.write_all(&(hashes.len() as u32).to_be_bytes())?;
+        for hash in hashes {
+            self.inner.write_all(hash.as_bytes())?;
+        }
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send store chunks - transfer chunk data to server
+    pub fn send_store_chunks(&mut self, chunks: &[(ContentHash, Bytes)]) -> Result<()> {
+        // Calculate payload size: count(4) + (hash(32) + len(4) + data)*count
+        let payload_len: usize = 4 + chunks
+            .iter()
+            .map(|(_, data)| 32 + 4 + data.len())
+            .sum::<usize>();
+        write_header(&mut self.inner, msg::STORE_CHUNKS, payload_len as u32)?;
+        self.inner.write_all(&(chunks.len() as u32).to_be_bytes())?;
+        for (hash, data) in chunks {
+            self.inner.write_all(hash.as_bytes())?;
+            self.inner.write_all(&(data.len() as u32).to_be_bytes())?;
+            self.inner.write_all(data)?;
+        }
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send write manifest - tell server to assemble file from chunks
+    pub fn send_write_manifest(
+        &mut self,
+        path: &Path,
+        manifest: &FileManifest,
+        executable: bool,
+    ) -> Result<()> {
+        let path_encoded = encode_path(path);
+        // path_len(2) + path + executable(1) + file_hash(32) + size(8) + chunk_count(4) + hashes
+        let payload_len = path_encoded.len() + 1 + 32 + 8 + 4 + manifest.chunks.len() * 32;
+        write_header(&mut self.inner, msg::WRITE_MANIFEST, payload_len as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(manifest.file_hash.as_bytes())?;
+        self.inner.write_all(&manifest.size.to_be_bytes())?;
+        self.inner
+            .write_all(&(manifest.chunks.len() as u32).to_be_bytes())?;
+        for hash in &manifest.chunks {
+            self.inner.write_all(hash.as_bytes())?;
+        }
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Send write manifest without flushing (for batch operations)
+    pub fn send_write_manifest_no_flush(
+        &mut self,
+        path: &Path,
+        manifest: &FileManifest,
+        executable: bool,
+    ) -> Result<()> {
+        let path_encoded = encode_path(path);
+        let payload_len = path_encoded.len() + 1 + 32 + 8 + 4 + manifest.chunks.len() * 32;
+        write_header(&mut self.inner, msg::WRITE_MANIFEST, payload_len as u32)?;
+        self.inner.write_all(&path_encoded)?;
+        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(manifest.file_hash.as_bytes())?;
+        self.inner.write_all(&manifest.size.to_be_bytes())?;
+        self.inner
+            .write_all(&(manifest.chunks.len() as u32).to_be_bytes())?;
+        for hash in &manifest.chunks {
+            self.inner.write_all(hash.as_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Flush the underlying writer
     pub fn flush(&mut self) -> Result<()> {
         self.inner.flush()?;
@@ -321,7 +435,7 @@ pub enum Message {
         /// Errors (index, message) for failed operations
         errors: Vec<(u32, String)>,
     },
-    // Delta operations
+    // Legacy delta operations (deprecated - use CAS instead)
     SignatureReq {
         path: PathBuf,
     },
@@ -334,6 +448,25 @@ pub enum Message {
         path: PathBuf,
         /// Compressed delta data
         delta: Vec<u8>,
+        executable: bool,
+    },
+    // CAS (Content-Addressable Storage) operations
+    /// Client asks server which chunks are missing
+    CheckChunks {
+        hashes: Vec<ContentHash>,
+    },
+    /// Server responds with missing chunk hashes
+    MissingChunks {
+        hashes: Vec<ContentHash>,
+    },
+    /// Client sends chunk data to server
+    StoreChunks {
+        chunks: Vec<(ContentHash, Bytes)>,
+    },
+    /// Client tells server to assemble file from chunks
+    WriteManifest {
+        path: PathBuf,
+        manifest: FileManifest,
         executable: bool,
     },
 }
@@ -473,6 +606,98 @@ impl<R: Read> ProtocolReader<R> {
                 Ok(Message::WriteDelta {
                     path,
                     delta,
+                    executable,
+                })
+            }
+
+            // CAS operations
+            msg::CHECK_CHUNKS => {
+                let mut count_buf = [0u8; 4];
+                self.inner.read_exact(&mut count_buf)?;
+                let count = u32::from_be_bytes(count_buf) as usize;
+
+                let mut hashes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut hash_buf = [0u8; 32];
+                    self.inner.read_exact(&mut hash_buf)?;
+                    hashes.push(ContentHash::from_raw(hash_buf));
+                }
+
+                Ok(Message::CheckChunks { hashes })
+            }
+
+            msg::MISSING_CHUNKS => {
+                let mut count_buf = [0u8; 4];
+                self.inner.read_exact(&mut count_buf)?;
+                let count = u32::from_be_bytes(count_buf) as usize;
+
+                let mut hashes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut hash_buf = [0u8; 32];
+                    self.inner.read_exact(&mut hash_buf)?;
+                    hashes.push(ContentHash::from_raw(hash_buf));
+                }
+
+                Ok(Message::MissingChunks { hashes })
+            }
+
+            msg::STORE_CHUNKS => {
+                let mut count_buf = [0u8; 4];
+                self.inner.read_exact(&mut count_buf)?;
+                let count = u32::from_be_bytes(count_buf) as usize;
+
+                let mut chunks = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut hash_buf = [0u8; 32];
+                    self.inner.read_exact(&mut hash_buf)?;
+                    let hash = ContentHash::from_raw(hash_buf);
+
+                    let mut len_buf = [0u8; 4];
+                    self.inner.read_exact(&mut len_buf)?;
+                    let data_len = u32::from_be_bytes(len_buf) as usize;
+
+                    let mut data = vec![0u8; data_len];
+                    self.inner.read_exact(&mut data)?;
+
+                    chunks.push((hash, Bytes::from(data)));
+                }
+
+                Ok(Message::StoreChunks { chunks })
+            }
+
+            msg::WRITE_MANIFEST => {
+                let path = decode_path(&mut self.inner)?;
+
+                let mut exec_buf = [0u8; 1];
+                self.inner.read_exact(&mut exec_buf)?;
+                let executable = exec_buf[0] != 0;
+
+                let mut file_hash_buf = [0u8; 32];
+                self.inner.read_exact(&mut file_hash_buf)?;
+                let file_hash = ContentHash::from_raw(file_hash_buf);
+
+                let mut size_buf = [0u8; 8];
+                self.inner.read_exact(&mut size_buf)?;
+                let size = u64::from_be_bytes(size_buf);
+
+                let mut chunk_count_buf = [0u8; 4];
+                self.inner.read_exact(&mut chunk_count_buf)?;
+                let chunk_count = u32::from_be_bytes(chunk_count_buf) as usize;
+
+                let mut chunks = Vec::with_capacity(chunk_count);
+                for _ in 0..chunk_count {
+                    let mut hash_buf = [0u8; 32];
+                    self.inner.read_exact(&mut hash_buf)?;
+                    chunks.push(ContentHash::from_raw(hash_buf));
+                }
+
+                Ok(Message::WriteManifest {
+                    path,
+                    manifest: FileManifest {
+                        file_hash,
+                        size,
+                        chunks,
+                    },
                     executable,
                 })
             }

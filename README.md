@@ -17,17 +17,19 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 | Remote dependencies | rsync required | Auto-deploy (~50MB Go) | Auto-deploy (~3MB Rust) |
 | Respects .gitignore | ❌ Manual exclude | ⚠️ Works but ignores global | ✅ **Automatic** |
 | Watch mode | ❌ External tools | ✅ Built-in | ✅ Built-in |
-| Intra-file delta sync | ✅ Fixed blocks | ❌ Whole files | ✅ **FastCDC** |
+| Deduplication | Per-file delta | ❌ Whole files | ✅ **Cross-file CAS** |
+| Intra-file delta | ✅ Fixed blocks | ❌ No | ✅ **FastCDC chunks** |
 
 ## Features
 
 - **Zero remote dependencies** — Agent auto-deploys via SSH (Linux x86_64/aarch64)
 - **Native .gitignore** — Respects your existing ignore files automatically
-- **FastCDC delta sync** — Content-defined chunking transfers only changed bytes, not whole files
+- **CAS deduplication** — Content-addressable storage ensures each chunk is only sent once, ever
+- **FastCDC chunking** — Content-defined chunking finds reusable blocks across all files
 - **Watch mode** — Continuous sync with debouncing
 - **Port forwarding** — Forward local ports to remote services through SSH
 - **Static binaries** — Works on any Linux server, no glibc version issues
-- **Fast** — BLAKE3 hashing, zstd compression, heed (LMDB) signature caching
+- **Fast** — BLAKE3 hashing, heed (LMDB) chunk store
 
 ## Quick Start
 
@@ -56,6 +58,7 @@ sequenceDiagram
     participant Local as Local Machine
     participant SSH as SSH Transport
     participant Remote as Remote Linux Server
+    participant CAS as Chunk Store (LMDB)
 
     Local->>SSH: Connect via SSH
     SSH->>Remote: Detect platform (uname)
@@ -66,18 +69,26 @@ sequenceDiagram
 
     Local->>Remote: Request snapshot
     Remote-->>Local: File hashes (BLAKE3)
-    Local->>Local: Compute diff
+    Local->>Local: Compute diff, chunk files with FastCDC
 
-    Note over Local,Remote: For modified files — intra-file delta sync
+    Note over Local,Remote: CAS deduplication — never send the same chunk twice
 
-    Local->>Remote: Request chunk signature
-    Remote-->>Local: FastCDC chunks (from cache or computed)
-    Local->>Local: Match chunks, generate delta
-    Local->>Remote: Send delta (only changed bytes, zstd compressed)
-    Remote->>Remote: Apply delta atomically
+    Local->>Remote: CHECK_CHUNKS [hash1, hash2, ...]
+    Remote->>CAS: Which hashes are missing?
+    CAS-->>Remote: [hash2, hash5] missing
+    Remote-->>Local: MISSING_CHUNKS [hash2, hash5]
+
+    Local->>Remote: STORE_CHUNKS [(hash2, data), (hash5, data)]
+    Remote->>CAS: Store new chunks
+    CAS-->>Remote: Stored
+
+    Local->>Remote: WRITE_MANIFEST {path, [hash1, hash2, hash3]}
+    Remote->>CAS: Read chunks, assemble file
+    CAS-->>Remote: File data
+    Remote->>Remote: Write file atomically
 ```
 
-**The key insight:** zsync embeds pre-compiled static agents for Linux x86_64 and aarch64. When you connect, it detects the remote platform, uploads the ~3MB agent binary, and runs it. The agent handles all file operations on the remote side.
+**The key insight:** zsync uses Content-Addressable Storage (CAS) with BLAKE3 hashes. Chunks are stored by their hash — if two files share content, those chunks are stored once. If you sync similar projects, unchanged code is never re-transferred. The server asks "which of these chunks do I need?" and you only send what's missing.
 
 No `apt install`. No version conflicts. No "rsync: command not found".
 

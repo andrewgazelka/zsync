@@ -13,6 +13,7 @@ dirs.workspace = true
 russh.workspace = true
 
 zsync-core = { path = "../core" }
+bytes.workspace = true
 
 [lints]
 workspace = true

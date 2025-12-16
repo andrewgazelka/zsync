@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 
 use zsync_core::{
-    ChunkCache, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter, Scanner,
-    Snapshot,
+    ChunkCache, ChunkStore, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter,
+    Scanner, Snapshot,
 };
 
 #[derive(Parser)]
@@ -57,10 +57,15 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
     // Ensure root directory exists
     std::fs::create_dir_all(root)?;
 
-    // Initialize chunk cache at {root}/.zsync/cache
+    // Initialize chunk cache at {root}/.zsync/cache (for legacy delta operations)
     let cache_path = root.join(".zsync").join("cache");
     let cache = ChunkCache::open(&cache_path)?;
     eprintln!("Chunk cache initialized at {}", cache_path.display());
+
+    // Initialize CAS chunk store at {root}/.zsync/cas
+    let cas_path = root.join(".zsync").join("cas");
+    let cas = ChunkStore::open(&cas_path)?;
+    eprintln!("CAS chunk store initialized at {}", cas_path.display());
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -77,7 +82,7 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
             Ok(msg) => {
                 let should_shutdown = matches!(msg, Message::Shutdown);
 
-                match handle_message(root, msg, &mut writer, &mut batch_mode, &cache) {
+                match handle_message(root, msg, &mut writer, &mut batch_mode, &cache, &cas) {
                     Ok(BatchResponse::Normal) => {}
                     Ok(BatchResponse::BatchStarted) => {
                         batch_errors.clear();
@@ -135,6 +140,7 @@ fn handle_message<W: Write>(
     writer: &mut ProtocolWriter<W>,
     batch_mode: &mut bool,
     cache: &ChunkCache,
+    cas: &ChunkStore,
 ) -> Result<BatchResponse> {
     match msg {
         Message::SnapshotReq => {
@@ -257,12 +263,68 @@ fn handle_message<W: Write>(
             }
         }
 
+        // CAS operations
+        Message::CheckChunks { hashes } => {
+            let missing = cas.find_missing(&hashes);
+            eprintln!(
+                "CheckChunks: {} requested, {} missing",
+                hashes.len(),
+                missing.len()
+            );
+            writer.send_missing_chunks(&missing)?;
+            Ok(BatchResponse::Normal)
+        }
+
+        Message::StoreChunks { chunks } => {
+            eprintln!("StoreChunks: storing {} chunks", chunks.len());
+            let new_count = cas.put_many(&chunks)?;
+            eprintln!("StoreChunks: {} new chunks stored", new_count);
+            writer.send_ok()?;
+            Ok(BatchResponse::Normal)
+        }
+
+        Message::WriteManifest {
+            path,
+            manifest,
+            executable,
+        } => {
+            let full_path = root.join(&path);
+            eprintln!(
+                "WriteManifest: {} ({} chunks, {} bytes)",
+                path.display(),
+                manifest.chunks.len(),
+                manifest.size
+            );
+
+            // Assemble file from CAS chunks
+            let data = cas.assemble(&manifest.chunks)?;
+
+            // Verify hash
+            let actual_hash = ContentHash::from_bytes(&data);
+            color_eyre::eyre::ensure!(
+                actual_hash == manifest.file_hash,
+                "hash mismatch after assembly: expected {}, got {}",
+                manifest.file_hash,
+                actual_hash
+            );
+
+            write_file(&full_path, &data, executable)?;
+
+            if *batch_mode {
+                Ok(BatchResponse::BatchOp)
+            } else {
+                writer.send_ok()?;
+                Ok(BatchResponse::Normal)
+            }
+        }
+
         // These are responses, not requests - shouldn't receive them
         Message::SnapshotResp(_)
         | Message::Ok
         | Message::Error(_)
         | Message::BatchResult { .. }
-        | Message::SignatureResp { .. } => {
+        | Message::SignatureResp { .. }
+        | Message::MissingChunks { .. } => {
             writer.send_error("Unexpected message type")?;
             Ok(BatchResponse::Normal)
         }

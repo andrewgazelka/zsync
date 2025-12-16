@@ -3426,6 +3426,7 @@ dependencies = [
 name = "zsync"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "color-eyre",
  "dirs",
@@ -3482,6 +3483,7 @@ dependencies = [
 name = "zsync-transport"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "color-eyre",
  "dirs",
  "russh",

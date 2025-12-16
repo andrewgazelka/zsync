@@ -20,7 +20,11 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tracing::{debug, error, info, warn};
 
-use zsync_core::{DeltaComputer, Scanner, Snapshot, ZsyncConfig};
+use bytes::Bytes;
+
+use zsync_core::{
+    ChunkConfig, ContentHash, FileManifest, Scanner, Snapshot, ZsyncConfig, chunk_data,
+};
 use zsync_transport::{AgentSession, SshTransport};
 
 const STYLES: Styles = Styles::styled()
@@ -217,82 +221,140 @@ fn scan_command(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Threshold for using delta transfers (files larger than this use delta)
-/// Set to 512 bytes to match FastCDC min chunk size - enables delta for most code files
-const DELTA_THRESHOLD: u64 = 512;
-
-/// Prepare a file for transfer, using delta if beneficial
-async fn prepare_transfer(
-    local: &Path,
-    path: &Path,
-    remote_snapshot: &Snapshot,
-    agent: &mut AgentSession,
+/// File prepared for CAS transfer
+struct FileTransfer {
+    path: PathBuf,
+    manifest: FileManifest,
     executable: bool,
-) -> Result<TransferData> {
-    let full_path = local.join(path);
-    let local_data = std::fs::read(&full_path)?;
+    /// Chunks that need to be transferred (hash -> data)
+    chunks: Vec<(ContentHash, Bytes)>,
+}
 
-    // Check if file exists on remote and is large enough for delta
-    if let Some(remote_entry) = remote_snapshot.files.get(path) {
-        if remote_entry.size >= DELTA_THRESHOLD && local_data.len() as u64 >= DELTA_THRESHOLD {
-            // Try delta transfer
-            match agent.get_signature(path).await {
-                Ok(sig_data) => {
-                    let sig = DeltaComputer::decompress_signature(&sig_data)?;
-                    let computer = DeltaComputer::new();
-                    let delta = computer.delta(&local_data, &sig);
-                    let compressed_delta = DeltaComputer::compress_delta(&delta)?;
+/// Prepare files for CAS transfer - chunks files and creates manifests
+fn prepare_cas_transfers(
+    local: &Path,
+    paths: &[&Path],
+    snapshot: &Snapshot,
+) -> Result<Vec<FileTransfer>> {
+    let mut transfers = Vec::with_capacity(paths.len());
 
-                    // Only use delta if it's significantly smaller
-                    if compressed_delta.len() < local_data.len() / 2 {
-                        debug!(
-                            "Using delta for {} ({} -> {} bytes, {:.1}% reduction)",
-                            path.display(),
-                            local_data.len(),
-                            compressed_delta.len(),
-                            (1.0 - compressed_delta.len() as f64 / local_data.len() as f64) * 100.0
-                        );
-                        return Ok(TransferData::Delta {
-                            data: compressed_delta,
-                            executable,
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Delta transfer failed for {}, using full: {e}",
-                        path.display()
-                    );
-                }
-            }
+    for path in paths {
+        let entry = snapshot
+            .files
+            .get(*path)
+            .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+        let full_path = local.join(path);
+        let data = std::fs::read(&full_path)?;
+        let file_hash = ContentHash::from_bytes(&data);
+
+        // Chunk the file
+        let config = ChunkConfig::default();
+        let chunks: Vec<_> = chunk_data(&data, &config).collect();
+        let chunk_hashes: Vec<ContentHash> = chunks.iter().map(|c| c.hash).collect();
+
+        // Create chunks with data
+        let mut file_chunks = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let start = chunk.offset as usize;
+            let end = start + chunk.length as usize;
+            file_chunks.push((chunk.hash, Bytes::copy_from_slice(&data[start..end])));
+        }
+
+        transfers.push(FileTransfer {
+            path: (*path).to_path_buf(),
+            manifest: FileManifest {
+                file_hash,
+                size: data.len() as u64,
+                chunks: chunk_hashes,
+            },
+            executable: entry.executable,
+            chunks: file_chunks,
+        });
+    }
+
+    Ok(transfers)
+}
+
+/// Transfer files using CAS - only sends chunks the server doesn't have
+async fn transfer_files_cas(
+    agent: &mut AgentSession,
+    transfers: &[FileTransfer],
+    to_delete: &[&Path],
+) -> Result<()> {
+    // Collect all unique chunks across all files
+    let mut all_chunks: std::collections::HashMap<ContentHash, Bytes> =
+        std::collections::HashMap::new();
+    for transfer in transfers {
+        for (hash, data) in &transfer.chunks {
+            all_chunks.entry(*hash).or_insert_with(|| data.clone());
         }
     }
 
-    // Fall back to full file transfer with compression
-    let compressed = zstd::encode_all(local_data.as_slice(), 3)?;
-    if compressed.len() < local_data.len() {
-        debug!(
-            "Compressed {} ({} -> {} bytes)",
-            path.display(),
-            local_data.len(),
-            compressed.len()
-        );
-        Ok(TransferData::CompressedFull {
-            data: local_data,
-            executable,
-        })
-    } else {
-        Ok(TransferData::Full {
-            data: local_data,
-            executable,
-        })
-    }
-}
+    let all_hashes: Vec<ContentHash> = all_chunks.keys().copied().collect();
+    info!(
+        "Checking {} unique chunks across {} files...",
+        all_hashes.len(),
+        transfers.len()
+    );
 
-enum TransferData {
-    Full { data: Vec<u8>, executable: bool },
-    CompressedFull { data: Vec<u8>, executable: bool },
-    Delta { data: Vec<u8>, executable: bool },
+    // Ask server which chunks are missing
+    let missing_hashes = agent.check_chunks(&all_hashes).await?;
+    let missing_set: std::collections::HashSet<_> = missing_hashes.iter().collect();
+
+    // Prepare missing chunks for transfer
+    let chunks_to_send: Vec<(ContentHash, Bytes)> = all_chunks
+        .into_iter()
+        .filter(|(h, _)| missing_set.contains(h))
+        .collect();
+
+    let total_chunk_bytes: usize = chunks_to_send.iter().map(|(_, d)| d.len()).sum();
+
+    if !chunks_to_send.is_empty() {
+        info!(
+            "Transferring {} missing chunks ({})...",
+            chunks_to_send.len(),
+            humansize::format_size(total_chunk_bytes, humansize::BINARY)
+        );
+        agent.store_chunks(&chunks_to_send).await?;
+    } else {
+        info!("All chunks already on server (deduplication win!)");
+    }
+
+    // Send file manifests and deletes in a batch
+    let total_ops = transfers.len() + to_delete.len();
+    agent.start_batch(total_ops as u32).await?;
+
+    for transfer in transfers {
+        debug!("Queueing manifest: {}", transfer.path.display());
+        agent
+            .queue_write_manifest(&transfer.path, &transfer.manifest, transfer.executable)
+            .await?;
+    }
+
+    for path in to_delete {
+        debug!("Queueing delete: {}", path.display());
+        agent.queue_delete_file(path).await?;
+    }
+
+    let result = agent.end_batch().await?;
+
+    if result.errors.is_empty() {
+        info!(
+            "Batch complete: {} operations successful",
+            result.success_count
+        );
+    } else {
+        warn!(
+            "Batch complete: {} successful, {} failed",
+            result.success_count,
+            result.errors.len()
+        );
+        for (idx, msg) in &result.errors {
+            error!("  Operation {idx}: {msg}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Perform a single sync operation using an existing agent session.
@@ -371,115 +433,22 @@ async fn sync_once(
     }
 
     // Collect all files to transfer
-    let added: Vec<_> = diff.added.iter().collect();
-    let modified: Vec<_> = diff.modified.iter().collect();
-    let to_delete: Vec<_> = if no_delete {
+    let mut all_paths: Vec<&Path> = Vec::new();
+    all_paths.extend(diff.added.iter().map(|p| p.as_path()));
+    all_paths.extend(diff.modified.iter().map(|p| p.as_path()));
+
+    let to_delete: Vec<&Path> = if no_delete {
         vec![]
     } else {
-        diff.removed.iter().collect()
+        diff.removed.iter().map(|p| p.as_path()).collect()
     };
 
-    let total_ops = added.len() + modified.len() + to_delete.len();
+    if !all_paths.is_empty() || !to_delete.is_empty() {
+        // Prepare CAS transfers (chunk files, create manifests)
+        let transfers = prepare_cas_transfers(local, &all_paths, &local_snapshot)?;
 
-    if total_ops > 0 {
-        // Prepare transfer data (delta for modified files where beneficial)
-        let mut transfers: Vec<(&Path, TransferData)> = Vec::new();
-        let mut total_bytes = 0u64;
-        let mut delta_count = 0usize;
-
-        // Added files - always full transfer
-        for path in &added {
-            let entry = local_snapshot
-                .files
-                .get(*path)
-                .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
-            let full_path = local.join(path);
-            let data = std::fs::read(&full_path)?;
-            total_bytes += data.len() as u64;
-            transfers.push((
-                path,
-                TransferData::Full {
-                    data,
-                    executable: entry.executable,
-                },
-            ));
-        }
-
-        // Modified files - try delta transfer
-        for path in &modified {
-            let entry = local_snapshot
-                .files
-                .get(*path)
-                .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
-            let transfer =
-                prepare_transfer(local, path, &remote_snapshot, agent, entry.executable).await?;
-            match &transfer {
-                TransferData::Delta { data, .. } => {
-                    delta_count += 1;
-                    total_bytes += data.len() as u64;
-                }
-                TransferData::Full { data, .. } | TransferData::CompressedFull { data, .. } => {
-                    total_bytes += data.len() as u64;
-                }
-            }
-            transfers.push((path, transfer));
-        }
-
-        if delta_count > 0 {
-            info!("Using delta transfer for {delta_count} modified files");
-        }
-
-        // Start batch mode for pipelining
-        info!(
-            "Transferring {} in {} operations (pipelined)...",
-            humansize::format_size(total_bytes, humansize::BINARY),
-            total_ops
-        );
-        agent.start_batch(total_ops as u32).await?;
-
-        // Queue all writes
-        for (i, (path, transfer)) in transfers.iter().enumerate() {
-            debug!(
-                "[{}/{}] Queueing {}",
-                i + 1,
-                transfers.len(),
-                path.display()
-            );
-            match transfer {
-                TransferData::Full { data, executable }
-                | TransferData::CompressedFull { data, executable } => {
-                    agent.queue_write_file(path, data, *executable).await?;
-                }
-                TransferData::Delta { data, executable } => {
-                    agent.queue_write_delta(path, data, *executable).await?;
-                }
-            }
-        }
-
-        // Queue all deletes
-        for path in &to_delete {
-            debug!("Queueing delete: {}", path.display());
-            agent.queue_delete_file(path).await?;
-        }
-
-        // End batch and get results
-        let result = agent.end_batch().await?;
-
-        if result.errors.is_empty() {
-            info!(
-                "Batch complete: {} operations successful",
-                result.success_count
-            );
-        } else {
-            warn!(
-                "Batch complete: {} successful, {} failed",
-                result.success_count,
-                result.errors.len()
-            );
-            for (idx, msg) in &result.errors {
-                error!("  Operation {idx}: {msg}");
-            }
-        }
+        // Transfer using CAS (deduplicating chunks)
+        transfer_files_cas(agent, &transfers, &to_delete).await?;
     }
 
     Ok(true)
@@ -613,109 +582,23 @@ async fn sync_command(
             return Ok(());
         }
 
-        let added: Vec<_> = diff.added.iter().collect();
-        let modified: Vec<_> = diff.modified.iter().collect();
-        let to_delete: Vec<_> = if no_delete {
+        // Collect all files to transfer
+        let mut all_paths: Vec<&Path> = Vec::new();
+        all_paths.extend(diff.added.iter().map(|p| p.as_path()));
+        all_paths.extend(diff.modified.iter().map(|p| p.as_path()));
+
+        let to_delete: Vec<&Path> = if no_delete {
             vec![]
         } else {
-            diff.removed.iter().collect()
+            diff.removed.iter().map(|p| p.as_path()).collect()
         };
 
-        let total_ops = added.len() + modified.len() + to_delete.len();
+        if !all_paths.is_empty() || !to_delete.is_empty() {
+            // Prepare CAS transfers (chunk files, create manifests)
+            let transfers = prepare_cas_transfers(local, &all_paths, &local_snapshot)?;
 
-        if total_ops > 0 {
-            let mut transfers: Vec<(&Path, TransferData)> = Vec::new();
-            let mut total_bytes = 0u64;
-            let mut delta_count = 0usize;
-
-            for path in &added {
-                let entry = local_snapshot
-                    .files
-                    .get(*path)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
-                let full_path = local.join(path);
-                let data = std::fs::read(&full_path)?;
-                total_bytes += data.len() as u64;
-                transfers.push((
-                    path,
-                    TransferData::Full {
-                        data,
-                        executable: entry.executable,
-                    },
-                ));
-            }
-
-            for path in &modified {
-                let entry = local_snapshot
-                    .files
-                    .get(*path)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
-                let transfer =
-                    prepare_transfer(local, path, &remote_snapshot, &mut agent, entry.executable)
-                        .await?;
-                match &transfer {
-                    TransferData::Delta { data, .. } => {
-                        delta_count += 1;
-                        total_bytes += data.len() as u64;
-                    }
-                    TransferData::Full { data, .. } | TransferData::CompressedFull { data, .. } => {
-                        total_bytes += data.len() as u64;
-                    }
-                }
-                transfers.push((path, transfer));
-            }
-
-            if delta_count > 0 {
-                info!("Using delta transfer for {delta_count} modified files");
-            }
-
-            info!(
-                "Transferring {} in {} operations (pipelined)...",
-                humansize::format_size(total_bytes, humansize::BINARY),
-                total_ops
-            );
-            agent.start_batch(total_ops as u32).await?;
-
-            for (i, (path, transfer)) in transfers.iter().enumerate() {
-                debug!(
-                    "[{}/{}] Queueing {}",
-                    i + 1,
-                    transfers.len(),
-                    path.display()
-                );
-                match transfer {
-                    TransferData::Full { data, executable }
-                    | TransferData::CompressedFull { data, executable } => {
-                        agent.queue_write_file(path, data, *executable).await?;
-                    }
-                    TransferData::Delta { data, executable } => {
-                        agent.queue_write_delta(path, data, *executable).await?;
-                    }
-                }
-            }
-
-            for path in &to_delete {
-                debug!("Queueing delete: {}", path.display());
-                agent.queue_delete_file(path).await?;
-            }
-
-            let result = agent.end_batch().await?;
-
-            if result.errors.is_empty() {
-                info!(
-                    "Batch complete: {} operations successful",
-                    result.success_count
-                );
-            } else {
-                warn!(
-                    "Batch complete: {} successful, {} failed",
-                    result.success_count,
-                    result.errors.len()
-                );
-                for (idx, msg) in &result.errors {
-                    error!("  Operation {idx}: {msg}");
-                }
-            }
+            // Transfer using CAS (deduplicating chunks)
+            transfer_files_cas(&mut agent, &transfers, &to_delete).await?;
         }
     }
 

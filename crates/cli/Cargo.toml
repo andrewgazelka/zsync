@@ -25,6 +25,7 @@ humansize.workspace = true
 
 zsync-core = { path = "../core" }
 zsync-transport = { path = "../transport" }
+bytes.workspace = true
 
 [lints]
 workspace = true
