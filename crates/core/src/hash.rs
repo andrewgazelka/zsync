@@ -17,6 +17,12 @@ impl ContentHash {
         Self(*blake3::hash(data).as_bytes())
     }
 
+    /// Create from raw bytes (for deserialization)
+    #[must_use]
+    pub fn from_raw(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Hash a file by path
     ///
     /// # Errors

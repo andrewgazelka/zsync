@@ -1,19 +1,23 @@
-//! SSH transport implementation using system ssh/scp commands
+//! SSH transport implementation using russh (pure Rust)
 //!
-//! Uses system SSH for reliability and to leverage user's existing SSH config.
+//! Uses russh for native Rust SSH with binary protocol support.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
 
 use color_eyre::Result;
-use tokio::process::{Child, Command};
+use russh::keys::key::PrivateKeyWithHashAlg;
+use russh::keys::{load_secret_key, PublicKey};
+use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info};
 
 use crate::Platform;
 use crate::agent::AgentBundle;
+use zsync_core::{Message, Snapshot, protocol};
 
 /// SSH transport for communicating with remote hosts
 pub struct SshTransport {
+    session: russh::client::Handle<ClientHandler>,
     host: String,
     port: u16,
     user: String,
@@ -21,19 +25,254 @@ pub struct SshTransport {
     agent_path: Option<PathBuf>,
 }
 
+struct ClientHandler;
+
+impl russh::client::Handler for ClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // TODO: Proper host key verification
+        Ok(true)
+    }
+}
+
+/// Active agent session for communicating with remote
+pub struct AgentSession {
+    channel: russh::Channel<russh::client::Msg>,
+    root: PathBuf,
+    buffer: Vec<u8>,
+}
+
+impl AgentSession {
+    /// Read exact number of bytes from channel
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        let mut offset = 0;
+
+        // First, drain from buffer
+        let drain_len = buf.len().min(self.buffer.len());
+        if drain_len > 0 {
+            buf[..drain_len].copy_from_slice(&self.buffer[..drain_len]);
+            self.buffer.drain(..drain_len);
+            offset = drain_len;
+        }
+
+        // Then read from channel
+        while offset < buf.len() {
+            match self.channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    let bytes = data.as_ref();
+                    let to_copy = (buf.len() - offset).min(bytes.len());
+                    buf[offset..offset + to_copy].copy_from_slice(&bytes[..to_copy]);
+                    offset += to_copy;
+
+                    // Buffer any extra
+                    if to_copy < bytes.len() {
+                        self.buffer.extend_from_slice(&bytes[to_copy..]);
+                    }
+                }
+                Some(ChannelMsg::Eof | ChannelMsg::Close) => {
+                    return Err(color_eyre::eyre::eyre!("Channel closed unexpectedly"));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(color_eyre::eyre::eyre!("Channel closed"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read a message from the agent
+    async fn read_message(&mut self) -> Result<Message> {
+        // Read header: type (1 byte) + length (4 bytes)
+        let mut header = [0u8; 5];
+        self.read_exact(&mut header).await?;
+
+        let msg_type = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+        // Read payload
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            self.read_exact(&mut payload).await?;
+        }
+
+        // Parse based on type
+        match msg_type {
+            protocol::msg::SNAPSHOT_RESP => {
+                let snapshot = decode_snapshot(&payload)?;
+                Ok(Message::SnapshotResp(snapshot))
+            }
+            protocol::msg::OK => Ok(Message::Ok),
+            protocol::msg::ERROR => {
+                let message = String::from_utf8_lossy(&payload).to_string();
+                Ok(Message::Error(message))
+            }
+            _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
+        }
+    }
+
+    /// Send raw bytes to agent
+    async fn send(&self, data: &[u8]) -> Result<()> {
+        self.channel.data(data).await?;
+        Ok(())
+    }
+
+    /// Get snapshot from remote
+    pub async fn snapshot(&mut self) -> Result<Snapshot> {
+        // Send snapshot request: type=0x01, len=0
+        self.send(&[protocol::msg::SNAPSHOT_REQ, 0, 0, 0, 0]).await?;
+
+        match self.read_message().await? {
+            Message::SnapshotResp(snapshot) => Ok(snapshot),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Snapshot failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    /// Write a file to the remote
+    pub async fn write_file(&mut self, path: &Path, data: &[u8], executable: bool) -> Result<()> {
+        // Build payload: path_len(2) + path + executable(1) + data
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len() + 1 + data.len();
+
+        // Header
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::WRITE_FILE);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+
+        // Path
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+
+        // Executable flag
+        msg.push(u8::from(executable));
+
+        // Data
+        msg.extend_from_slice(data);
+
+        self.send(&msg).await?;
+
+        match self.read_message().await? {
+            Message::Ok => Ok(()),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Write failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    /// Delete a file on the remote
+    pub async fn delete_file(&mut self, path: &Path) -> Result<()> {
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let payload_len = 2 + path_bytes.len();
+
+        let mut msg = Vec::with_capacity(5 + payload_len);
+        msg.push(protocol::msg::DELETE_FILE);
+        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&path_bytes);
+
+        self.send(&msg).await?;
+
+        match self.read_message().await? {
+            Message::Ok => Ok(()),
+            Message::Error(msg) => Err(color_eyre::eyre::eyre!("Delete failed: {msg}")),
+            other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
+        }
+    }
+
+    /// Shutdown the agent
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.send(&[protocol::msg::SHUTDOWN, 0, 0, 0, 0]).await?;
+        let _ = self.read_message().await;
+        Ok(())
+    }
+
+    /// Get the remote root path
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Decode snapshot from binary (same format as protocol.rs)
+fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
+    use std::io::{Cursor, Read};
+    use zsync_core::{ContentHash, FileEntry};
+
+    let mut cursor = Cursor::new(data);
+
+    // File count
+    let mut count_buf = [0u8; 4];
+    cursor.read_exact(&mut count_buf)?;
+    let count = u32::from_be_bytes(count_buf) as usize;
+
+    let mut entries = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        // Path
+        let mut path_len_buf = [0u8; 2];
+        cursor.read_exact(&mut path_len_buf)?;
+        let path_len = u16::from_be_bytes(path_len_buf) as usize;
+
+        let mut path_buf = vec![0u8; path_len];
+        cursor.read_exact(&mut path_buf)?;
+        let path = PathBuf::from(String::from_utf8_lossy(&path_buf).to_string());
+
+        // Size
+        let mut size_buf = [0u8; 8];
+        cursor.read_exact(&mut size_buf)?;
+        let size = u64::from_be_bytes(size_buf);
+
+        // Hash
+        let mut hash_buf = [0u8; 32];
+        cursor.read_exact(&mut hash_buf)?;
+        let hash = ContentHash::from_raw(hash_buf);
+
+        // Executable
+        let mut exec_buf = [0u8; 1];
+        cursor.read_exact(&mut exec_buf)?;
+        let executable = exec_buf[0] != 0;
+
+        entries.push(FileEntry {
+            path,
+            size,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            hash,
+            executable,
+        });
+    }
+
+    Ok(Snapshot::from_entries(entries))
+}
+
 impl SshTransport {
     /// Connect to a remote host via SSH
-    ///
-    /// # Errors
-    /// Returns an error if connection or platform detection fails
     pub async fn connect(host: &str, port: u16, user: &str) -> Result<Self> {
         info!("Connecting to {user}@{host}:{port}");
 
+        let config = Arc::new(russh::client::Config::default());
+        let handler = ClientHandler;
+
+        let mut session = russh::client::connect(config, (host, port), handler).await?;
+
+        // Try to authenticate with SSH keys
+        let authenticated = Self::authenticate(&mut session, user).await?;
+        if !authenticated {
+            return Err(color_eyre::eyre::eyre!(
+                "SSH authentication failed for {user}@{host}"
+            ));
+        }
+
         // Detect remote platform
-        let platform = Self::detect_platform_static(host, port, user).await?;
-        info!("Remote platform: {:?}", platform);
+        let platform = Self::detect_platform(&session).await?;
+        info!("Remote platform: {platform:?}");
 
         Ok(Self {
+            session,
             host: host.to_string(),
             port,
             user: user.to_string(),
@@ -42,47 +281,84 @@ impl SshTransport {
         })
     }
 
-    /// Detect remote platform via uname
-    async fn detect_platform_static(host: &str, port: u16, user: &str) -> Result<Platform> {
-        let output = Command::new("ssh")
-            .args([
-                "-p",
-                &port.to_string(),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                &format!("{user}@{host}"),
-                "uname -s && uname -m",
-            ])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            return Err(color_eyre::eyre::eyre!(
-                "SSH connection failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+    /// Authenticate using SSH keys
+    async fn authenticate(
+        session: &mut russh::client::Handle<ClientHandler>,
+        user: &str,
+    ) -> Result<bool> {
+        // Try SSH agent first
+        if let Ok(mut agent) = russh::keys::agent::client::AgentClient::connect_env().await {
+            let identities = agent.request_identities().await?;
+            for identity in identities {
+                if let Ok(result) = session
+                    .authenticate_publickey_with(user, identity, None, &mut agent)
+                    .await
+                {
+                    if result.success() {
+                        info!("Authenticated via SSH agent");
+                        return Ok(true);
+                    }
+                }
+            }
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let lines: Vec<&str> = stdout.lines().collect();
+        // Try default key paths
+        let home = dirs::home_dir().ok_or_else(|| color_eyre::eyre::eyre!("No home directory"))?;
+        let key_paths = [
+            home.join(".ssh/id_ed25519"),
+            home.join(".ssh/id_rsa"),
+            home.join(".ssh/id_ecdsa"),
+        ];
 
+        for key_path in &key_paths {
+            if key_path.exists() {
+                match load_secret_key(key_path, None) {
+                    Ok(key) => {
+                        let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+                        if let Ok(result) = session.authenticate_publickey(user, key_with_hash).await
+                        {
+                            if result.success() {
+                                info!("Authenticated with key: {}", key_path.display());
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Failed to load key {}: {e}", key_path.display());
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Detect remote platform via uname
+    async fn detect_platform(session: &russh::client::Handle<ClientHandler>) -> Result<Platform> {
+        let mut channel = session.channel_open_session().await?;
+        channel.exec(true, "uname -s && uname -m").await?;
+
+        let mut stdout = String::new();
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.push_str(&String::from_utf8_lossy(&data));
+                }
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            }
+        }
+
+        let lines: Vec<&str> = stdout.lines().collect();
         if lines.len() < 2 {
             return Err(color_eyre::eyre::eyre!(
                 "Failed to detect platform: unexpected uname output: {stdout}"
             ));
         }
 
-        Platform::from_uname(lines.first().unwrap_or(&""), lines.get(1).unwrap_or(&"")).ok_or_else(
-            || {
-                color_eyre::eyre::eyre!(
-                    "Unsupported platform: {} {}",
-                    lines.first().unwrap_or(&""),
-                    lines.get(1).unwrap_or(&"")
-                )
-            },
-        )
+        Platform::from_uname(lines[0], lines[1]).ok_or_else(|| {
+            color_eyre::eyre::eyre!("Unsupported platform: {} {}", lines[0], lines[1])
+        })
     }
 
     /// Get the remote platform
@@ -91,15 +367,35 @@ impl SshTransport {
         self.platform
     }
 
-    /// Build SSH destination string
-    fn ssh_dest(&self) -> String {
-        format!("{}@{}", self.user, self.host)
+    /// Execute a command on the remote host
+    pub async fn execute(&self, command: &str) -> Result<(String, String, i32)> {
+        let mut channel = self.session.channel_open_session().await?;
+        channel.exec(true, command).await?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut exit_code = 0;
+
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.push_str(&String::from_utf8_lossy(&data));
+                }
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    stderr.push_str(&String::from_utf8_lossy(&data));
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_code = exit_status as i32;
+                }
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            }
+        }
+
+        Ok((stdout, stderr, exit_code))
     }
 
     /// Ensure the agent is deployed to the remote host
-    ///
-    /// # Errors
-    /// Returns an error if agent deployment fails
     pub async fn ensure_agent(&mut self, bundle: &AgentBundle) -> Result<PathBuf> {
         if let Some(path) = &self.agent_path {
             return Ok(path.clone());
@@ -110,13 +406,14 @@ impl SshTransport {
         let remote_path = format!("{remote_dir}/zsync-agent");
 
         // Check if agent already exists
-        let (stdout, _, _exit) = self
+        let (stdout, _, _) = self
             .execute(&format!("test -x ~/{remote_path} && echo exists"))
             .await?;
 
         if stdout.contains("exists") {
             debug!("Agent already deployed at ~/{remote_path}");
-            let home = self.get_home_dir().await?;
+            let (home, _, _) = self.execute("echo $HOME").await?;
+            let home = home.trim();
             let path = PathBuf::from(format!("{home}/{remote_path}"));
             self.agent_path = Some(path.clone());
             return Ok(path);
@@ -132,148 +429,68 @@ impl SshTransport {
             color_eyre::eyre::eyre!("No agent binary for platform {:?}", self.platform)
         })?;
 
-        // Write to temp file and scp
-        let temp_file = tempfile::NamedTempFile::new()?;
-        tokio::fs::write(temp_file.path(), agent_data).await?;
-
         // Get remote home dir
-        let home = self.get_home_dir().await?;
+        let (home, _, _) = self.execute("echo $HOME").await?;
+        let home = home.trim();
         let full_path = format!("{home}/{remote_path}");
 
-        // SCP upload
-        let status = Command::new("scp")
-            .args([
-                "-P",
-                &self.port.to_string(),
-                "-o",
-                "BatchMode=yes",
-                temp_file.path().to_str().unwrap(),
-                &format!("{}:{}", self.ssh_dest(), full_path),
-            ])
-            .status()
-            .await?;
-
-        if !status.success() {
-            return Err(color_eyre::eyre::eyre!("SCP upload failed"));
-        }
+        // Upload via exec + stdin
+        self.upload_bytes(agent_data, &full_path).await?;
 
         // Make executable
         self.execute(&format!("chmod +x {full_path}")).await?;
 
         info!("Agent deployed to {full_path}");
-        self.agent_path = Some(PathBuf::from(full_path.clone()));
+        self.agent_path = Some(PathBuf::from(&full_path));
         Ok(PathBuf::from(full_path))
     }
 
-    /// Get remote home directory
-    async fn get_home_dir(&self) -> Result<String> {
-        let (stdout, _, _) = self.execute("echo $HOME").await?;
-        Ok(stdout.trim().to_string())
-    }
-
-    /// Execute a command on the remote host
-    ///
-    /// # Errors
-    /// Returns an error if execution fails
-    pub async fn execute(&self, command: &str) -> Result<(String, String, i32)> {
-        let output = Command::new("ssh")
-            .args([
-                "-p",
-                &self.port.to_string(),
-                "-o",
-                "BatchMode=yes",
-                &self.ssh_dest(),
-                command,
-            ])
-            .output()
+    /// Upload bytes to remote path via exec + stdin
+    async fn upload_bytes(&self, data: &[u8], remote_path: &str) -> Result<()> {
+        let mut channel = self.session.channel_open_session().await?;
+        channel
+            .exec(true, format!("cat > {remote_path}"))
             .await?;
 
-        Ok((
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-            output.status.code().unwrap_or(-1),
-        ))
-    }
+        channel.data(data).await?;
+        channel.eof().await?;
 
-    /// Upload a file to the remote host
-    ///
-    /// # Errors
-    /// Returns an error if upload fails
-    pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<()> {
-        let status = Command::new("scp")
-            .args([
-                "-P",
-                &self.port.to_string(),
-                "-o",
-                "BatchMode=yes",
-                local_path.to_str().unwrap(),
-                &format!("{}:{}", self.ssh_dest(), remote_path),
-            ])
-            .status()
-            .await?;
-
-        if !status.success() {
-            return Err(color_eyre::eyre::eyre!("SCP upload failed"));
+        // Wait for completion
+        loop {
+            if let Some(ChannelMsg::Eof | ChannelMsg::Close) = channel.wait().await {
+                break;
+            }
         }
+
         Ok(())
     }
 
-    /// Download a file from the remote host
-    ///
-    /// # Errors
-    /// Returns an error if download fails
-    pub async fn download(&self, remote_path: &str, local_path: &Path) -> Result<()> {
-        let status = Command::new("scp")
-            .args([
-                "-P",
-                &self.port.to_string(),
-                "-o",
-                "BatchMode=yes",
-                &format!("{}:{}", self.ssh_dest(), remote_path),
-                local_path.to_str().unwrap(),
-            ])
-            .status()
-            .await?;
-
-        if !status.success() {
-            return Err(color_eyre::eyre::eyre!("SCP download failed"));
-        }
-        Ok(())
-    }
-
-    /// Upload bytes directly to a remote path
-    ///
-    /// # Errors
-    /// Returns an error if upload fails
-    pub async fn upload_bytes(&self, data: &[u8], remote_path: &str) -> Result<()> {
-        let temp_file = tempfile::NamedTempFile::new()?;
-        tokio::fs::write(temp_file.path(), data).await?;
-        self.upload(temp_file.path(), remote_path).await
-    }
-
-    /// Start the agent process on the remote host
-    ///
-    /// # Errors
-    /// Returns an error if starting the agent fails
-    pub fn start_agent(&self, root: &str) -> Result<Child> {
+    /// Start the agent process on the remote host and return a session
+    pub async fn start_agent(&self, root: &str) -> Result<AgentSession> {
         let agent_path = self.agent_path.as_ref().ok_or_else(|| {
             color_eyre::eyre::eyre!("Agent not deployed - call ensure_agent first")
         })?;
 
-        let child = Command::new("ssh")
-            .args([
-                "-p",
-                &self.port.to_string(),
-                "-o",
-                "BatchMode=yes",
-                &self.ssh_dest(),
-                &format!("{} daemon --root {}", agent_path.display(), root),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let channel = self.session.channel_open_session().await?;
+        channel
+            .exec(
+                true,
+                format!("{} daemon --root {root}", agent_path.display()),
+            )
+            .await?;
 
-        Ok(child)
+        Ok(AgentSession {
+            channel,
+            root: PathBuf::from(root),
+            buffer: Vec::new(),
+        })
+    }
+
+    /// Disconnect from the remote host
+    pub async fn disconnect(self) -> Result<()> {
+        self.session
+            .disconnect(Disconnect::ByApplication, "", "English")
+            .await?;
+        Ok(())
     }
 }

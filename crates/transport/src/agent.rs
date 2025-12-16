@@ -97,6 +97,7 @@ impl OwnedAgentBundle {
         self.binaries.insert(platform, data);
     }
 
+    #[expect(clippy::disallowed_methods, reason = "intentional leak for CLI lifetime")]
     fn into_static(self) -> AgentBundle {
         let mut bundle = AgentBundle::new();
         for (platform, data) in self.binaries {
@@ -112,10 +113,11 @@ impl OwnedAgentBundle {
 mod tests {
     use super::*;
 
+    static TEST_DATA: &[u8] = &[1, 2, 3];
+
     #[test]
     fn test_bundle_add_get() {
         let mut bundle = AgentBundle::new();
-        static TEST_DATA: &[u8] = &[1, 2, 3];
         bundle.add(Platform::LinuxX86_64, TEST_DATA);
 
         assert!(bundle.has(Platform::LinuxX86_64));

@@ -6,7 +6,7 @@ pub mod agent;
 pub mod ssh;
 
 pub use agent::AgentBundle;
-pub use ssh::SshTransport;
+pub use ssh::{AgentSession, SshTransport};
 
 /// Target platform for agent binaries
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

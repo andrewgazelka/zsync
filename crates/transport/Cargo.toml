@@ -9,12 +9,8 @@ description = "SSH transport for zsync"
 color-eyre.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-bytes.workspace = true
-uuid.workspace = true
-zstd.workspace = true
-tempfile.workspace = true
+dirs.workspace = true
+russh.workspace = true
 
 zsync-core = { path = "../core" }
 

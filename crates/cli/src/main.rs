@@ -158,7 +158,7 @@ fn scan_command(path: &PathBuf) -> Result<()> {
 
     eprintln!("Files: {}", snapshot.len());
     let total_size: u64 = snapshot.files.values().map(|f| f.size).sum();
-    eprintln!("Total size: {} bytes", total_size);
+    eprintln!("Total size: {total_size} bytes");
 
     if snapshot.len() <= 20 {
         eprintln!("\nFiles:");
