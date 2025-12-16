@@ -48,6 +48,24 @@ impl Scanner {
         self
     }
 
+    /// Create a configured walk builder
+    fn walk_builder(&self) -> WalkBuilder {
+        let mut builder = WalkBuilder::new(&self.root);
+        builder
+            .hidden(false) // Include hidden files (e.g., .env.example)
+            .git_ignore(true) // Respect .gitignore
+            .git_global(true) // Respect global gitignore
+            .git_exclude(true) // Respect .git/info/exclude
+            .require_git(false) // Work even without .git directory
+            .filter_entry(|e| e.file_name() != ".git");
+
+        for pattern in &self.extra_ignores {
+            builder.add_ignore(pattern);
+        }
+
+        builder
+    }
+
     /// Scan the directory and return all file entries
     ///
     /// # Errors
@@ -55,19 +73,7 @@ impl Scanner {
     pub fn scan(&self) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
 
-        let mut builder = WalkBuilder::new(&self.root);
-        builder
-            .hidden(false) // Don't skip hidden files by default
-            .git_ignore(true) // Respect .gitignore
-            .git_global(true) // Respect global gitignore
-            .git_exclude(true); // Respect .git/info/exclude
-
-        // Add extra ignore patterns
-        for pattern in &self.extra_ignores {
-            builder.add_ignore(pattern);
-        }
-
-        for result in builder.build() {
+        for result in self.walk_builder().build() {
             let entry = result?;
             let path = entry.path();
 
@@ -111,18 +117,7 @@ impl Scanner {
     pub fn scan_paths(&self) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
 
-        let mut builder = WalkBuilder::new(&self.root);
-        builder
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true);
-
-        for pattern in &self.extra_ignores {
-            builder.add_ignore(pattern);
-        }
-
-        for result in builder.build() {
+        for result in self.walk_builder().build() {
             let entry = result?;
             let path = entry.path();
 

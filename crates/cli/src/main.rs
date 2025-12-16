@@ -64,6 +64,7 @@ enum Commands {
     /// Sync local directory to remote
     Sync {
         /// Local directory path
+        #[arg(default_value = ".")]
         local: PathBuf,
 
         /// Remote destination (user@host:/path)
@@ -77,6 +78,7 @@ enum Commands {
     /// Watch and continuously sync changes
     Watch {
         /// Local directory path
+        #[arg(default_value = ".")]
         local: PathBuf,
 
         /// Remote destination (user@host:/path)
@@ -94,6 +96,7 @@ enum Commands {
     /// Scan local directory and print snapshot
     Scan {
         /// Directory to scan
+        #[arg(default_value = ".")]
         path: PathBuf,
 
         /// Output format (json, summary)
