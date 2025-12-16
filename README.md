@@ -14,11 +14,12 @@ A modern alternative to rsync and mutagen for syncing files over SSH.
 
 | Feature | rsync | mutagen | zsync |
 |---------|-------|---------|-------|
-| Remote dependencies | rsync required | Auto-deploy (~50MB Go) | Auto-deploy (~3MB Rust) |
-| Respects .gitignore | ❌ Manual exclude | ⚠️ Works but ignores global | ✅ **Automatic** |
+| Cross-sync dedup | ❌ None | ❌ None | ✅ **Persistent CAS** |
+| Agent binary size | N/A (requires install) | ~50MB | **~3MB** |
+| Remote setup | Manual install | Auto-deploy | **Auto-deploy** |
+| Respects .gitignore | ❌ Manual flags | ⚠️ Ignores global | ✅ **Full support** |
 | Watch mode | ❌ External tools | ✅ Built-in | ✅ Built-in |
-| Cross-file dedup | ❌ Per-file only | ❌ Per-session only | ✅ **Persistent CAS** |
-| Intra-file delta | ✅ Fixed 8KB blocks | ✅ Fixed 8KB blocks | ✅ **FastCDC (adaptive)** |
+| Chunking | Fixed 8KB blocks | Fixed 8KB blocks | **FastCDC (adaptive)** |
 
 ## Features
 
