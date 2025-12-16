@@ -257,6 +257,196 @@ enum TransferData {
     Delta { data: Vec<u8>, executable: bool },
 }
 
+/// Perform a single sync operation using an existing agent session.
+/// Returns true if changes were synced, false if already in sync.
+async fn sync_once(
+    local: &Path,
+    agent: &mut AgentSession,
+    includes: &[String],
+    no_delete: bool,
+) -> Result<bool> {
+    // Scan local
+    debug!("Scanning local directory...");
+    let mut scanner = Scanner::new(local);
+    for pattern in includes {
+        scanner = scanner.include(pattern);
+    }
+    let entries = scanner.scan()?;
+    let local_snapshot = Snapshot::from_entries(entries);
+    debug!("Found {} local files", local_snapshot.len());
+
+    // Get remote snapshot
+    debug!("Getting remote snapshot...");
+    let remote_snapshot = agent.snapshot().await?;
+    debug!("Found {} remote files", remote_snapshot.len());
+
+    // Compute diff
+    let diff = remote_snapshot.diff(&local_snapshot);
+
+    let deletions = if no_delete { 0 } else { diff.removed.len() };
+
+    if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
+        return Ok(false);
+    }
+
+    info!(
+        "Changes: {} added, {} modified, {} removed",
+        diff.added.len(),
+        diff.modified.len(),
+        deletions
+    );
+
+    // Print individual file changes
+    for path in &diff.added {
+        info!("  + {}", path.display());
+    }
+    for path in &diff.modified {
+        info!("  ~ {}", path.display());
+    }
+    if !no_delete {
+        for path in &diff.removed {
+            info!("  - {}", path.display());
+        }
+    }
+
+    // Collect all files to transfer
+    let added: Vec<_> = diff.added.iter().collect();
+    let modified: Vec<_> = diff.modified.iter().collect();
+    let to_delete: Vec<_> = if no_delete {
+        vec![]
+    } else {
+        diff.removed.iter().collect()
+    };
+
+    let total_ops = added.len() + modified.len() + to_delete.len();
+
+    if total_ops > 0 {
+        // Prepare transfer data (delta for modified files where beneficial)
+        let mut transfers: Vec<(&Path, TransferData)> = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut delta_count = 0usize;
+
+        // Added files - always full transfer
+        for path in &added {
+            let entry = local_snapshot
+                .files
+                .get(*path)
+                .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+            let full_path = local.join(path);
+            let data = std::fs::read(&full_path)?;
+            total_bytes += data.len() as u64;
+            transfers.push((
+                path,
+                TransferData::Full {
+                    data,
+                    executable: entry.executable,
+                },
+            ));
+        }
+
+        // Modified files - try delta transfer
+        for path in &modified {
+            let entry = local_snapshot
+                .files
+                .get(*path)
+                .ok_or_else(|| color_eyre::eyre::eyre!("File not found: {}", path.display()))?;
+            let transfer =
+                prepare_transfer(local, path, &remote_snapshot, agent, entry.executable).await?;
+            match &transfer {
+                TransferData::Delta { data, .. } => {
+                    delta_count += 1;
+                    total_bytes += data.len() as u64;
+                }
+                TransferData::Full { data, .. } | TransferData::CompressedFull { data, .. } => {
+                    total_bytes += data.len() as u64;
+                }
+            }
+            transfers.push((path, transfer));
+        }
+
+        if delta_count > 0 {
+            info!("Using delta transfer for {delta_count} modified files");
+        }
+
+        // Start batch mode for pipelining
+        info!(
+            "Transferring {} bytes in {} operations (pipelined)...",
+            total_bytes, total_ops
+        );
+        agent.start_batch(total_ops as u32).await?;
+
+        // Queue all writes
+        for (i, (path, transfer)) in transfers.iter().enumerate() {
+            debug!(
+                "[{}/{}] Queueing {}",
+                i + 1,
+                transfers.len(),
+                path.display()
+            );
+            match transfer {
+                TransferData::Full { data, executable }
+                | TransferData::CompressedFull { data, executable } => {
+                    agent.queue_write_file(path, data, *executable).await?;
+                }
+                TransferData::Delta { data, executable } => {
+                    agent.queue_write_delta(path, data, *executable).await?;
+                }
+            }
+        }
+
+        // Queue all deletes
+        for path in &to_delete {
+            debug!("Queueing delete: {}", path.display());
+            agent.queue_delete_file(path).await?;
+        }
+
+        // End batch and get results
+        let result = agent.end_batch().await?;
+
+        if result.errors.is_empty() {
+            info!(
+                "Batch complete: {} operations successful",
+                result.success_count
+            );
+        } else {
+            warn!(
+                "Batch complete: {} successful, {} failed",
+                result.success_count,
+                result.errors.len()
+            );
+            for (idx, msg) in &result.errors {
+                error!("  Operation {idx}: {msg}");
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// Connect to remote and start agent session
+async fn connect_and_start_agent(
+    host: &str,
+    port: u16,
+    user: &str,
+    remote_path: &str,
+) -> Result<(SshTransport, AgentSession)> {
+    let mut transport = SshTransport::connect(host, port, user).await?;
+
+    let bundle = embedded_agents::embedded_bundle();
+    if bundle.platforms().is_empty() {
+        return Err(color_eyre::eyre::eyre!(
+            "No embedded agent binaries - cannot sync"
+        ));
+    }
+
+    transport.ensure_agent(&bundle).await?;
+
+    debug!("Starting remote agent...");
+    let agent = transport.start_agent(remote_path).await?;
+
+    Ok((transport, agent))
+}
+
 async fn sync_command(
     local: &PathBuf,
     remote: &str,
@@ -274,7 +464,6 @@ async fn sync_command(
         remote_path
     );
 
-    // Scan local
     info!("Scanning local directory...");
     let mut scanner = Scanner::new(local);
     for pattern in includes {
@@ -284,31 +473,14 @@ async fn sync_command(
     let local_snapshot = Snapshot::from_entries(entries);
     info!("Found {} local files", local_snapshot.len());
 
-    // Connect to remote
-    let mut transport = SshTransport::connect(&host, port, &user).await?;
+    let (_transport, mut agent) = connect_and_start_agent(&host, port, &user, &remote_path).await?;
 
-    // Deploy agent
-    let bundle = embedded_agents::embedded_bundle();
-    if bundle.platforms().is_empty() {
-        return Err(color_eyre::eyre::eyre!(
-            "No embedded agent binaries - cannot sync"
-        ));
-    }
-
-    transport.ensure_agent(&bundle).await?;
-
-    // Start agent
-    info!("Starting remote agent...");
-    let mut agent = transport.start_agent(&remote_path).await?;
-
-    // Get remote snapshot
     info!("Getting remote snapshot...");
     let remote_snapshot = agent.snapshot().await?;
     info!("Found {} remote files", remote_snapshot.len());
 
-    // Compute diff
+    // Use sync_once logic but with pre-fetched snapshots for initial sync
     let diff = remote_snapshot.diff(&local_snapshot);
-
     let deletions = if no_delete { 0 } else { diff.removed.len() };
 
     if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
@@ -321,7 +493,6 @@ async fn sync_command(
             deletions
         );
 
-        // Print individual file changes
         for path in &diff.added {
             info!("  + {}", path.display());
         }
@@ -334,7 +505,6 @@ async fn sync_command(
             }
         }
 
-        // Collect all files to transfer
         let added: Vec<_> = diff.added.iter().collect();
         let modified: Vec<_> = diff.modified.iter().collect();
         let to_delete: Vec<_> = if no_delete {
@@ -346,12 +516,10 @@ async fn sync_command(
         let total_ops = added.len() + modified.len() + to_delete.len();
 
         if total_ops > 0 {
-            // Prepare transfer data (delta for modified files where beneficial)
             let mut transfers: Vec<(&Path, TransferData)> = Vec::new();
             let mut total_bytes = 0u64;
             let mut delta_count = 0usize;
 
-            // Added files - always full transfer
             for path in &added {
                 let entry = local_snapshot
                     .files
@@ -369,7 +537,6 @@ async fn sync_command(
                 ));
             }
 
-            // Modified files - try delta transfer
             for path in &modified {
                 let entry = local_snapshot
                     .files
@@ -394,14 +561,12 @@ async fn sync_command(
                 info!("Using delta transfer for {delta_count} modified files");
             }
 
-            // Start batch mode for pipelining
             info!(
                 "Transferring {} bytes in {} operations (pipelined)...",
                 total_bytes, total_ops
             );
             agent.start_batch(total_ops as u32).await?;
 
-            // Queue all writes
             for (i, (path, transfer)) in transfers.iter().enumerate() {
                 debug!(
                     "[{}/{}] Queueing {}",
@@ -420,13 +585,11 @@ async fn sync_command(
                 }
             }
 
-            // Queue all deletes
             for path in &to_delete {
                 debug!("Queueing delete: {}", path.display());
                 agent.queue_delete_file(path).await?;
             }
 
-            // End batch and get results
             let result = agent.end_batch().await?;
 
             if result.errors.is_empty() {
@@ -447,9 +610,7 @@ async fn sync_command(
         }
     }
 
-    // Shutdown agent
     agent.shutdown().await?;
-
     info!("Sync complete!");
     Ok(())
 }
@@ -472,8 +633,19 @@ async fn watch_command(
         remote_path
     );
 
+    // Connect and keep connection alive
+    let (mut transport, mut agent) =
+        connect_and_start_agent(&host, port, &user, &remote_path).await?;
+
     // Initial sync
-    sync_command(local, remote, port, includes, no_delete).await?;
+    info!("Initial sync...");
+    match sync_once(local, &mut agent, includes, no_delete).await {
+        Ok(true) => info!("Initial sync complete"),
+        Ok(false) => info!("Already in sync!"),
+        Err(e) => {
+            return Err(e.wrap_err("initial sync failed"));
+        }
+    }
 
     // Setup file watcher
     let (tx, rx) = mpsc::channel();
@@ -502,11 +674,31 @@ async fn watch_command(
                     continue;
                 }
 
-                info!("Detected {} changed paths, syncing...", paths.len());
+                debug!("Detected {} changed paths", paths.len());
 
-                // Re-sync
-                if let Err(e) = sync_command(local, remote, port, includes, no_delete).await {
-                    error!("Sync failed: {e}");
+                // Sync using existing connection
+                match sync_once(local, &mut agent, includes, no_delete).await {
+                    Ok(true) => {}  // Changes synced, already logged
+                    Ok(false) => {} // No actual changes, stay quiet
+                    Err(e) => {
+                        warn!("Sync failed: {e}, reconnecting...");
+                        // Try to reconnect
+                        match connect_and_start_agent(&host, port, &user, &remote_path).await {
+                            Ok((new_transport, new_agent)) => {
+                                transport = new_transport;
+                                agent = new_agent;
+                                info!("Reconnected, retrying sync...");
+                                if let Err(e) =
+                                    sync_once(local, &mut agent, includes, no_delete).await
+                                {
+                                    error!("Sync failed after reconnect: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Reconnection failed: {e}");
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -516,6 +708,8 @@ async fn watch_command(
         }
     }
 
+    drop(transport); // Explicit drop to silence unused warning
+    agent.shutdown().await?;
     Ok(())
 }
 
