@@ -251,6 +251,15 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
     Ok(Snapshot::from_entries(entries))
 }
 
+/// Parsed SSH config for a specific host
+struct SshHostConfig {
+    identity_agent: Option<PathBuf>,
+    identity_files: Vec<PathBuf>,
+    port: Option<u16>,
+    user: Option<String>,
+    host_name: Option<String>,
+}
+
 impl SshTransport {
     /// Connect to a remote host via SSH
     pub async fn connect(host: &str, port: u16, user: &str) -> Result<Self> {
@@ -262,7 +271,7 @@ impl SshTransport {
         let mut session = russh::client::connect(config, (host, port), handler).await?;
 
         // Try to authenticate with SSH keys
-        let authenticated = Self::authenticate(&mut session, user).await?;
+        let authenticated = Self::authenticate(&mut session, user, host).await?;
         if !authenticated {
             return Err(color_eyre::eyre::eyre!(
                 "SSH authentication failed for {user}@{host}"
@@ -283,39 +292,97 @@ impl SshTransport {
         })
     }
 
-    /// Get the SSH agent socket path from SSH config or environment
-    fn get_agent_socket_path() -> Option<PathBuf> {
-        let home = dirs::home_dir()?;
-
-        // First, try to parse ~/.ssh/config for IdentityAgent
-        let ssh_config_path = home.join(".ssh/config");
-        if let Ok(content) = std::fs::read_to_string(&ssh_config_path) {
-            // Look for "IdentityAgent" directive (case-insensitive)
-            // Handles both global (Host *) and per-host settings
-            for line in content.lines() {
-                let line = line.trim();
-                if line.to_lowercase().starts_with("identityagent") {
-                    // Parse: IdentityAgent "path" or IdentityAgent 'path' or IdentityAgent path
-                    let value = line
-                        .split_once(char::is_whitespace)
-                        .map(|(_, v)| v.trim())?;
-
-                    // Remove quotes if present
-                    let value = value.trim_matches('"').trim_matches('\'');
-
-                    // Expand ~ to home directory
-                    let expanded = if value.starts_with("~/") {
-                        home.join(&value[2..])
-                    } else {
-                        PathBuf::from(value)
-                    };
-
-                    if expanded.exists() {
-                        debug!("Found IdentityAgent in SSH config: {}", expanded.display());
-                        return Some(expanded);
-                    }
-                }
+    /// Parse SSH config for a specific host using ssh2-config
+    fn parse_ssh_config(host: &str) -> SshHostConfig {
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                return SshHostConfig {
+                    identity_agent: None,
+                    identity_files: Vec::new(),
+                    port: None,
+                    user: None,
+                    host_name: None,
+                };
             }
+        };
+
+        let ssh_config_path = home.join(".ssh/config");
+        let file = match std::fs::File::open(&ssh_config_path) {
+            Ok(f) => f,
+            Err(_) => {
+                return SshHostConfig {
+                    identity_agent: None,
+                    identity_files: Vec::new(),
+                    port: None,
+                    user: None,
+                    host_name: None,
+                };
+            }
+        };
+
+        let mut reader = std::io::BufReader::new(file);
+        let config = match ssh2_config::SshConfig::default().parse(
+            &mut reader,
+            ssh2_config::ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Failed to parse SSH config: {e}");
+                return SshHostConfig {
+                    identity_agent: None,
+                    identity_files: Vec::new(),
+                    port: None,
+                    user: None,
+                    host_name: None,
+                };
+            }
+        };
+
+        let params = config.query(host);
+
+        // Get IdentityAgent from unsupported_fields (ssh2-config parses but doesn't expose it)
+        // Note: ssh2-config splits on whitespace, so paths with spaces are split into multiple values
+        // We need to join them back together
+        let identity_agent = params
+            .unsupported_fields
+            .get("identityagent")
+            .and_then(|values| {
+                // Join all values with spaces (paths with spaces get split)
+                let value = values.join(" ");
+                let value = value.trim_matches('"').trim_matches('\'');
+                let expanded = if value.starts_with("~/") {
+                    home.join(&value[2..])
+                } else {
+                    PathBuf::from(value)
+                };
+                if expanded.exists() {
+                    debug!(
+                        "Found IdentityAgent for host {host}: {}",
+                        expanded.display()
+                    );
+                    Some(expanded)
+                } else {
+                    debug!("IdentityAgent path does not exist: {}", expanded.display());
+                    None
+                }
+            });
+
+        SshHostConfig {
+            identity_agent,
+            identity_files: params.identity_file.unwrap_or_default(),
+            port: params.port,
+            user: params.user,
+            host_name: params.host_name,
+        }
+    }
+
+    /// Get the SSH agent socket path from SSH config or environment
+    fn get_agent_socket_path(host: &str) -> Option<PathBuf> {
+        // First, try SSH config for this specific host
+        let config = Self::parse_ssh_config(host);
+        if let Some(agent_path) = config.identity_agent {
+            return Some(agent_path);
         }
 
         // Fall back to SSH_AUTH_SOCK environment variable
@@ -334,9 +401,10 @@ impl SshTransport {
     async fn authenticate(
         session: &mut russh::client::Handle<ClientHandler>,
         user: &str,
+        host: &str,
     ) -> Result<bool> {
         // Try SSH agent first (from config or environment)
-        if let Some(agent_path) = Self::get_agent_socket_path() {
+        if let Some(agent_path) = Self::get_agent_socket_path(host) {
             match AgentClient::connect_uds(&agent_path).await {
                 Ok(mut agent) => {
                     debug!("Connected to SSH agent at {}", agent_path.display());

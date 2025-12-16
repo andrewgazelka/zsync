@@ -180,7 +180,13 @@ fn scan_command(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn sync_command(local: &PathBuf, remote: &str, port: u16, includes: &[String], no_delete: bool) -> Result<()> {
+async fn sync_command(
+    local: &PathBuf,
+    remote: &str,
+    port: u16,
+    includes: &[String],
+    no_delete: bool,
+) -> Result<()> {
     let (user, host, remote_path) = parse_remote(remote)?;
 
     info!(
