@@ -40,6 +40,77 @@ use zsync_transport::{AgentSession, SshTransport};
 /// batch provides good throughput while staying well under the limit.
 const CHUNK_BATCH_BYTES: u64 = 1_000_000;
 
+/// Maximum number of manifest operations per batch to avoid SSH flow control deadlock.
+///
+/// File manifest operations are smaller than chunk uploads, but sending hundreds
+/// without waiting for acknowledgement can still fill the SSH window.
+const MANIFEST_BATCH_SIZE: usize = 100;
+
+/// A manifest operation to be batched.
+enum ManifestOp<'a> {
+    Write {
+        path: &'a std::path::Path,
+        manifest: &'a FileManifest,
+        mode: u32,
+    },
+    Delete {
+        path: &'a std::path::Path,
+    },
+}
+
+/// Result of batched manifest operations.
+struct ManifestBatchResult {
+    success_count: u32,
+    errors: Vec<(u32, String)>,
+}
+
+/// Execute manifest operations in batches to avoid SSH flow control deadlock.
+async fn execute_manifest_batches(
+    agent: &mut AgentSession,
+    ops: &[ManifestOp<'_>],
+    pb: &indicatif::ProgressBar,
+) -> Result<ManifestBatchResult> {
+    let mut total_success = 0u32;
+    let mut all_errors: Vec<(u32, String)> = Vec::new();
+
+    for batch in ops.chunks(MANIFEST_BATCH_SIZE) {
+        agent.start_batch(batch.len() as u32).await?;
+
+        for op in batch {
+            match op {
+                ManifestOp::Write {
+                    path,
+                    manifest,
+                    mode,
+                } => {
+                    let file_name = path
+                        .file_name()
+                        .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
+                    pb.set_prefix(file_name.to_string());
+                    agent.queue_write_manifest(path, manifest, *mode).await?;
+                }
+                ManifestOp::Delete { path } => {
+                    let file_name = path
+                        .file_name()
+                        .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
+                    pb.set_prefix(format!("(delete) {file_name}"));
+                    agent.queue_delete_file(path).await?;
+                }
+            }
+            pb.inc(1);
+        }
+
+        let result = agent.end_batch().await?;
+        total_success += result.success_count;
+        all_errors.extend(result.errors);
+    }
+
+    Ok(ManifestBatchResult {
+        success_count: total_success,
+        errors: all_errors,
+    })
+}
+
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -169,7 +240,7 @@ async fn main() -> Result<()> {
 
     // Initialize combined logging: file (detailed trace) + console (through MultiProgress)
     // The guard must be kept alive for the log file to be written
-    let session = debug_log::init(cli.verbose);
+    let session = debug_log::init();
 
     // Show log file path at startup (direct eprintln, not through tracing)
     eprintln!(
@@ -400,44 +471,30 @@ async fn transfer_files_cas(
         upload_bar.finish();
     }
 
-    // Send file manifests and deletes in a batch
+    // Send file manifests and deletes in batches to avoid SSH flow control deadlock
     let total_ops = (transfers.len() + to_delete.len()) as u64;
-    agent.start_batch(total_ops as u32).await?;
-
-    // Show progress bar for file syncing
     let pb = progress::SyncProgress::file_sync_bar(total_ops);
 
+    // Collect all operations to batch them
+    let mut all_ops: Vec<ManifestOp<'_>> = Vec::with_capacity(transfers.len() + to_delete.len());
     for transfer in transfers {
-        // Show current file name in progress bar
-        let file_name = transfer
-            .path
-            .file_name()
-            .map_or_else(|| transfer.path.to_string_lossy(), |n| n.to_string_lossy());
-        pb.set_prefix(file_name.to_string());
-        agent
-            .queue_write_manifest(&transfer.path, &transfer.manifest, transfer.mode)
-            .await?;
-        pb.inc(1);
+        all_ops.push(ManifestOp::Write {
+            path: &transfer.path,
+            manifest: &transfer.manifest,
+            mode: transfer.mode,
+        });
     }
-
     for path in to_delete {
-        let file_name = path
-            .file_name()
-            .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
-        pb.set_prefix(format!("(delete) {file_name}"));
-        agent.queue_delete_file(path).await?;
-        pb.inc(1);
+        all_ops.push(ManifestOp::Delete { path });
     }
 
+    let batch_result = execute_manifest_batches(agent, &all_ops, &pb).await?;
     pb.finish_and_clear();
 
-    let result = agent.end_batch().await?;
-    progress.finish(result.success_count, result.errors.len());
+    progress.finish(batch_result.success_count, batch_result.errors.len());
 
-    if !result.errors.is_empty() {
-        for (idx, msg) in &result.errors {
-            error!("  Operation {idx}: {msg}");
-        }
+    for (idx, msg) in &batch_result.errors {
+        error!("  Operation {idx}: {msg}");
     }
 
     Ok(())
