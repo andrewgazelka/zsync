@@ -62,13 +62,16 @@ fn multi() -> &'static indicatif::MultiProgress {
 }
 
 /// Status verbs for cargo-style output (right-aligned to 12 chars)
-struct Status;
-
-impl Status {
-    const CHECKING: &str = "Checking";
-    const UPLOADING: &str = "Uploading";
-    const SYNCED: &str = "Synced";
-    const SKIPPED: &str = "Skipped";
+mod status {
+    pub const CONNECTING: &str = "Connecting";
+    pub const CONNECTED: &str = "Connected";
+    pub const SCANNING: &str = "Scanning";
+    pub const CHECKING: &str = "Checking";
+    pub const UPLOADING: &str = "Uploading";
+    pub const SYNCED: &str = "Synced";
+    pub const IN_SYNC: &str = "In sync";
+    pub const SKIPPED: &str = "Skipped";
+    pub const WATCHING: &str = "Watching";
 }
 
 /// Print a cargo-style status line, coordinated with any active progress bars
@@ -76,6 +79,42 @@ fn print_status(status: &str, message: &str) {
     let style = console::Style::new().green().bold();
     let line = format!("{:>12} {}", style.apply_to(status), message);
     multi().println(line).ok();
+}
+
+// ========== Connection Status ==========
+
+/// Show "Connecting to host:port..."
+pub fn connecting(host: &str, port: u16) {
+    print_status(status::CONNECTING, &format!("{host}:{port}..."));
+}
+
+/// Show "Connected via SSH agent" or similar auth method
+pub fn connected(auth_method: &str) {
+    print_status(status::CONNECTED, &format!("via {auth_method}"));
+}
+
+// ========== Scan Status ==========
+
+/// Show "Scanning N local files..."
+pub fn scanning_local(count: usize) {
+    print_status(status::SCANNING, &format!("{count} local files..."));
+}
+
+/// Show "Checking N remote files..."
+pub fn checking_remote(count: usize) {
+    print_status(status::CHECKING, &format!("{count} remote files..."));
+}
+
+/// Show "In sync N files" when already synchronized
+pub fn already_in_sync(count: usize) {
+    print_status(status::IN_SYNC, &format!("{count} files"));
+}
+
+// ========== Watch Mode ==========
+
+/// Show "Watching for changes..."
+pub fn watching() {
+    print_status(status::WATCHING, "for changes (Ctrl+C to stop)");
 }
 
 /// Progress bar for chunk uploads with byte-level tracking
@@ -121,7 +160,7 @@ impl SyncProgress {
     /// Show the initial "Checking X chunks across Y files" message
     pub fn checking(chunks: usize, files: usize) {
         print_status(
-            Status::CHECKING,
+            status::CHECKING,
             &format!("{chunks} unique chunks across {files} files..."),
         );
     }
@@ -141,7 +180,7 @@ impl SyncProgress {
                 .expect("valid template")
                 .progress_chars("=> "),
         );
-        pb.set_message(Status::UPLOADING);
+        pb.set_message(status::UPLOADING);
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
         // Set initial Ghostty progress
@@ -156,7 +195,7 @@ impl SyncProgress {
     /// Show "All chunks already on server" message
     pub fn chunks_deduped() {
         print_status(
-            Status::SKIPPED,
+            status::SKIPPED,
             "all chunks already on server (deduplication win!)",
         );
     }
@@ -188,7 +227,7 @@ impl SyncProgress {
 
         if error_count == 0 {
             print_status(
-                Status::SYNCED,
+                status::SYNCED,
                 &format!("{success_count} files in {elapsed_str}"),
             );
         } else {

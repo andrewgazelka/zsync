@@ -516,7 +516,7 @@ async fn sync_once(
     }
     let entries = scanner.scan()?;
     let local_snapshot = Snapshot::from_entries(entries);
-    debug!("Found {} local files", local_snapshot.len());
+    progress::scanning_local(local_snapshot.len());
 
     // Warn if local directory appears empty
     if local_snapshot.is_empty() {
@@ -527,9 +527,8 @@ async fn sync_once(
     }
 
     // Get remote snapshot
-    debug!("Getting remote snapshot...");
     let remote_snapshot = agent.snapshot().await?;
-    debug!("Found {} remote files", remote_snapshot.len());
+    progress::checking_remote(remote_snapshot.len());
 
     // Compute diff
     let diff = remote_snapshot.diff(&local_snapshot);
@@ -537,11 +536,7 @@ async fn sync_once(
     let deletions = if no_delete { 0 } else { diff.removed.len() };
 
     if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
-        debug!(
-            "Already in sync ({} local, {} remote)",
-            local_snapshot.len(),
-            remote_snapshot.len()
-        );
+        progress::already_in_sync(local_snapshot.len());
         return Ok(false);
     }
 
@@ -634,7 +629,9 @@ async fn connect_and_start_agent(
     user: &str,
     remote_path: &str,
 ) -> Result<(SshTransport, AgentSession)> {
+    progress::connecting(host, port);
     let mut transport = SshTransport::connect(host, port, user).await?;
+    progress::connected("SSH");
 
     let bundle = embedded_agents::embedded_bundle();
     if bundle.platforms().is_empty() {
@@ -680,14 +677,13 @@ async fn sync_command(
         );
     }
 
-    info!("Scanning local directory...");
     let mut scanner = Scanner::new(local);
     for pattern in includes {
         scanner = scanner.include(pattern);
     }
     let entries = scanner.scan()?;
     let local_snapshot = Snapshot::from_entries(entries);
-    info!("Found {} local files", local_snapshot.len());
+    progress::scanning_local(local_snapshot.len());
 
     // Warn if local directory appears empty - might indicate wrong path or overly aggressive gitignore
     if local_snapshot.is_empty() {
@@ -700,25 +696,15 @@ async fn sync_command(
 
     let (_transport, mut agent) = connect_and_start_agent(&host, port, &user, &remote_path).await?;
 
-    info!("Getting remote snapshot...");
     let remote_snapshot = agent.snapshot().await?;
-    info!("Found {} remote files", remote_snapshot.len());
+    progress::checking_remote(remote_snapshot.len());
 
     // Use sync_once logic but with pre-fetched snapshots for initial sync
     let diff = remote_snapshot.diff(&local_snapshot);
     let deletions = if no_delete { 0 } else { diff.removed.len() };
 
     if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
-        info!(
-            "Already in sync! ({} local files, {} remote files)",
-            local_snapshot.len(),
-            remote_snapshot.len()
-        );
-        // Show sample matching files in debug mode
-        if !local_snapshot.files.is_empty() {
-            let sample: Vec<_> = local_snapshot.files.keys().take(3).collect();
-            debug!("Sample matching files: {:?}", sample);
-        }
+        progress::already_in_sync(local_snapshot.len());
     } else {
         // Count modification reasons
         let (hash_only, mode_only, both) =
@@ -858,15 +844,8 @@ async fn watch_command(
         forward_handles.push(handle);
     }
 
-    // Initial sync
-    info!("Initial sync...");
-    match sync_once(local, &mut agent, &all_includes, no_delete).await {
-        Ok(true) => info!("Initial sync complete"),
-        Ok(false) => info!("Already in sync!"),
-        Err(e) => {
-            return Err(e.wrap_err("initial sync failed"));
-        }
-    }
+    // Initial sync (progress output comes from sync_once/transfer_files_cas)
+    sync_once(local, &mut agent, &all_includes, no_delete).await?;
 
     // Setup file watcher
     let (tx, rx) = mpsc::channel();
@@ -883,7 +862,7 @@ async fn watch_command(
 
     debouncer.watch(local, RecursiveMode::Recursive)?;
 
-    info!("Watching for changes (Ctrl+C to stop)...");
+    progress::watching();
 
     // Process file change events
     loop {
