@@ -29,6 +29,17 @@ use zsync_core::{
 };
 use zsync_transport::{AgentSession, SshTransport};
 
+/// Maximum bytes of chunk data per batch to avoid SSH flow control deadlock.
+///
+/// When uploading chunks, we send them in batches of approximately this size.
+/// Each batch is a separate STORE_CHUNKS message that gets an OK response
+/// before the next batch is sent. This prevents the SSH channel from filling
+/// up and deadlocking when the agent can't process data fast enough.
+///
+/// The default SSH window size is typically 2MB (2097152 bytes), so 1MB per
+/// batch provides good throughput while staying well under the limit.
+const CHUNK_BATCH_BYTES: u64 = 1_000_000;
+
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -343,12 +354,48 @@ async fn transfer_files_cas(
         };
         upload_bar.set_current_file(&file_summary);
 
-        // Stream chunks with real-time progress updates
-        agent
-            .store_chunks_with_progress(&chunks_to_send, |bytes| {
-                upload_bar.add_bytes(bytes);
-            })
-            .await?;
+        // Split chunks into batches to avoid SSH flow control deadlock.
+        // Each batch is sent as a separate STORE_CHUNKS message, and we wait
+        // for the OK response before sending the next batch.
+        let mut batch: Vec<(ContentHash, Bytes)> = Vec::new();
+        let mut batch_bytes: u64 = 0;
+
+        for (hash, data) in chunks_to_send {
+            let chunk_wire_bytes = 36 + data.len() as u64; // header + data
+
+            // If adding this chunk would exceed batch limit, flush the current batch first
+            if !batch.is_empty() && batch_bytes + chunk_wire_bytes > CHUNK_BATCH_BYTES {
+                tracing::debug!(
+                    "Sending batch of {} chunks ({} bytes)",
+                    batch.len(),
+                    batch_bytes
+                );
+                agent
+                    .store_chunks_with_progress(&batch, |bytes| {
+                        upload_bar.add_bytes(bytes);
+                    })
+                    .await?;
+                batch.clear();
+                batch_bytes = 0;
+            }
+
+            batch.push((hash, data));
+            batch_bytes += chunk_wire_bytes;
+        }
+
+        // Send any remaining chunks in the final batch
+        if !batch.is_empty() {
+            tracing::debug!(
+                "Sending final batch of {} chunks ({} bytes)",
+                batch.len(),
+                batch_bytes
+            );
+            agent
+                .store_chunks_with_progress(&batch, |bytes| {
+                    upload_bar.add_bytes(bytes);
+                })
+                .await?;
+        }
 
         upload_bar.finish();
     }
