@@ -60,12 +60,25 @@ impl Snapshot {
         for (path, new_entry) in &other.files {
             match self.files.get(path) {
                 None => added.push(path.clone()),
-                Some(old_entry)
-                    if old_entry.hash != new_entry.hash || old_entry.mode != new_entry.mode =>
-                {
-                    modified.push(path.clone());
+                Some(old_entry) => {
+                    let hash_changed = old_entry.hash != new_entry.hash;
+                    let mode_changed = old_entry.mode != new_entry.mode;
+
+                    if hash_changed || mode_changed {
+                        let reason = match (hash_changed, mode_changed) {
+                            (true, true) => ModifyReason::Both,
+                            (true, false) => ModifyReason::HashChanged,
+                            (false, true) => ModifyReason::ModeChanged,
+                            (false, false) => unreachable!(),
+                        };
+                        modified.push(ModifiedFile {
+                            path: path.clone(),
+                            reason,
+                            old_mode: old_entry.mode,
+                            new_mode: new_entry.mode,
+                        });
+                    }
                 }
-                _ => {}
             }
         }
 
@@ -90,6 +103,28 @@ impl Snapshot {
     }
 }
 
+/// Reason why a file is considered modified
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModifyReason {
+    /// Only content hash changed
+    HashChanged,
+    /// Only mode (permissions) changed
+    ModeChanged,
+    /// Both hash and mode changed
+    Both,
+}
+
+/// A modified file with its reason and old/new values
+#[derive(Debug, Clone)]
+pub struct ModifiedFile {
+    pub path: PathBuf,
+    pub reason: ModifyReason,
+    /// Old mode (from remote/old snapshot)
+    pub old_mode: u32,
+    /// New mode (from local/new snapshot)
+    pub new_mode: u32,
+}
+
 /// Differences between two snapshots
 #[derive(Debug, Clone)]
 pub struct SnapshotDiff {
@@ -97,8 +132,8 @@ pub struct SnapshotDiff {
     pub added: Vec<PathBuf>,
     /// Files that exist in old but not in new
     pub removed: Vec<PathBuf>,
-    /// Files that exist in both but have different content
-    pub modified: Vec<PathBuf>,
+    /// Files that exist in both but have different content or mode
+    pub modified: Vec<ModifiedFile>,
 }
 
 impl SnapshotDiff {
@@ -162,6 +197,8 @@ mod tests {
         let diff = old.diff(&new);
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
-        assert_eq!(diff.modified, vec![PathBuf::from("a.txt")]);
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].path, PathBuf::from("a.txt"));
+        assert_eq!(diff.modified[0].reason, ModifyReason::HashChanged);
     }
 }

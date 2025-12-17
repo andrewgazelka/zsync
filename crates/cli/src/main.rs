@@ -402,12 +402,29 @@ async fn sync_once(
         return Ok(false);
     }
 
+    // Count modification reasons
+    let (hash_only, mode_only, both) = diff.modified.iter().fold((0, 0, 0), |(h, m, b), f| match f
+        .reason
+    {
+        zsync_core::ModifyReason::HashChanged => (h + 1, m, b),
+        zsync_core::ModifyReason::ModeChanged => (h, m + 1, b),
+        zsync_core::ModifyReason::Both => (h, m, b + 1),
+    });
+
     info!(
         "Changes: {} added, {} modified, {} removed",
         diff.added.len(),
         diff.modified.len(),
         deletions
     );
+
+    // Show breakdown if there are mode-only changes (common cross-platform issue)
+    if mode_only > 0 || both > 0 {
+        info!(
+            "  Modified breakdown: {} content, {} mode-only, {} both",
+            hash_only, mode_only, both
+        );
+    }
 
     // Print individual file changes with sizes
     for path in &diff.added {
@@ -418,12 +435,22 @@ async fn sync_once(
             humansize::format_size(size, humansize::BINARY)
         );
     }
-    for path in &diff.modified {
-        let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
+    for m in &diff.modified {
+        let size = local_snapshot.files.get(&m.path).map_or(0, |e| e.size);
+        let reason = match m.reason {
+            zsync_core::ModifyReason::HashChanged => "content".to_string(),
+            zsync_core::ModifyReason::ModeChanged => {
+                format!("mode {:o}->{:o}", m.old_mode, m.new_mode)
+            }
+            zsync_core::ModifyReason::Both => {
+                format!("content+mode {:o}->{:o}", m.old_mode, m.new_mode)
+            }
+        };
         info!(
-            "  ~ {} ({})",
-            path.display(),
-            humansize::format_size(size, humansize::BINARY)
+            "  ~ {} ({}, {})",
+            m.path.display(),
+            humansize::format_size(size, humansize::BINARY),
+            reason
         );
     }
     if !no_delete {
@@ -435,7 +462,7 @@ async fn sync_once(
     // Collect all files to transfer
     let mut all_paths: Vec<&Path> = Vec::new();
     all_paths.extend(diff.added.iter().map(std::path::PathBuf::as_path));
-    all_paths.extend(diff.modified.iter().map(std::path::PathBuf::as_path));
+    all_paths.extend(diff.modified.iter().map(|m| m.path.as_path()));
 
     let to_delete: Vec<&Path> = if no_delete {
         vec![]
@@ -550,12 +577,30 @@ async fn sync_command(
             debug!("Sample matching files: {:?}", sample);
         }
     } else {
+        // Count modification reasons
+        let (hash_only, mode_only, both) =
+            diff.modified
+                .iter()
+                .fold((0, 0, 0), |(h, m, b), f| match f.reason {
+                    zsync_core::ModifyReason::HashChanged => (h + 1, m, b),
+                    zsync_core::ModifyReason::ModeChanged => (h, m + 1, b),
+                    zsync_core::ModifyReason::Both => (h, m, b + 1),
+                });
+
         info!(
             "Changes: {} added, {} modified, {} removed",
             diff.added.len(),
             diff.modified.len(),
             deletions
         );
+
+        // Show breakdown if there are mode-only changes (common cross-platform issue)
+        if mode_only > 0 || both > 0 {
+            info!(
+                "  Modified breakdown: {} content, {} mode-only, {} both",
+                hash_only, mode_only, both
+            );
+        }
 
         for path in &diff.added {
             let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
@@ -565,12 +610,22 @@ async fn sync_command(
                 humansize::format_size(size, humansize::BINARY)
             );
         }
-        for path in &diff.modified {
-            let size = local_snapshot.files.get(path).map_or(0, |e| e.size);
+        for m in &diff.modified {
+            let size = local_snapshot.files.get(&m.path).map_or(0, |e| e.size);
+            let reason = match m.reason {
+                zsync_core::ModifyReason::HashChanged => "content".to_string(),
+                zsync_core::ModifyReason::ModeChanged => {
+                    format!("mode {:o}->{:o}", m.old_mode, m.new_mode)
+                }
+                zsync_core::ModifyReason::Both => {
+                    format!("content+mode {:o}->{:o}", m.old_mode, m.new_mode)
+                }
+            };
             info!(
-                "  ~ {} ({})",
-                path.display(),
-                humansize::format_size(size, humansize::BINARY)
+                "  ~ {} ({}, {})",
+                m.path.display(),
+                humansize::format_size(size, humansize::BINARY),
+                reason
             );
         }
         if !no_delete {
@@ -589,7 +644,7 @@ async fn sync_command(
         // Collect all files to transfer
         let mut all_paths: Vec<&Path> = Vec::new();
         all_paths.extend(diff.added.iter().map(std::path::PathBuf::as_path));
-        all_paths.extend(diff.modified.iter().map(std::path::PathBuf::as_path));
+        all_paths.extend(diff.modified.iter().map(|m| m.path.as_path()));
 
         let to_delete: Vec<&Path> = if no_delete {
             vec![]

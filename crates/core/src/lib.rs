@@ -20,4 +20,4 @@ pub use delta::{Delta, DeltaComputer};
 pub use hash::ContentHash;
 pub use protocol::{FileManifest, Message, ProtocolReader, ProtocolWriter};
 pub use scan::{FileEntry, Scanner};
-pub use snapshot::Snapshot;
+pub use snapshot::{ModifiedFile, ModifyReason, Snapshot, SnapshotDiff};
