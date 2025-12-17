@@ -22,6 +22,8 @@ notify-debouncer-full.workspace = true
 dirs.workspace = true
 zstd.workspace = true
 humansize.workspace = true
+indicatif.workspace = true
+console.workspace = true
 
 zsync-core = { path = "../core" }
 zsync-transport = { path = "../transport" }

@@ -8,6 +8,7 @@
 //! - File watching with debouncing
 
 mod embedded_agents;
+mod progress;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -281,6 +282,8 @@ async fn transfer_files_cas(
     transfers: &[FileTransfer],
     to_delete: &[&Path],
 ) -> Result<()> {
+    let progress = progress::SyncProgress::new();
+
     // Collect all unique chunks across all files
     let mut all_chunks: std::collections::HashMap<ContentHash, Bytes> =
         std::collections::HashMap::new();
@@ -291,11 +294,7 @@ async fn transfer_files_cas(
     }
 
     let all_hashes: Vec<ContentHash> = all_chunks.keys().copied().collect();
-    info!(
-        "Checking {} unique chunks across {} files...",
-        all_hashes.len(),
-        transfers.len()
-    );
+    progress.checking(all_hashes.len(), transfers.len());
 
     // Ask server which chunks are missing
     let missing_hashes = agent.check_chunks(&all_hashes).await?;
@@ -307,48 +306,52 @@ async fn transfer_files_cas(
         .filter(|(h, _)| missing_set.contains(h))
         .collect();
 
-    let total_chunk_bytes: usize = chunks_to_send.iter().map(|(_, d)| d.len()).sum();
+    let total_chunk_bytes: u64 = chunks_to_send.iter().map(|(_, d)| d.len() as u64).sum();
 
     if chunks_to_send.is_empty() {
-        info!("All chunks already on server (deduplication win!)");
+        progress.chunks_deduped();
     } else {
-        info!(
-            "Transferring {} missing chunks ({})...",
-            chunks_to_send.len(),
-            humansize::format_size(total_chunk_bytes, humansize::BINARY)
-        );
+        // Show spinner for chunk upload (can't track real progress since it's one network call)
+        let spinner = progress.upload_spinner(total_chunk_bytes);
         agent.store_chunks(&chunks_to_send).await?;
+        spinner.finish_and_clear();
     }
 
     // Send file manifests and deletes in a batch
-    let total_ops = transfers.len() + to_delete.len();
+    let total_ops = (transfers.len() + to_delete.len()) as u64;
     agent.start_batch(total_ops as u32).await?;
 
+    // Show progress bar for file syncing
+    let pb = progress.file_sync_bar(total_ops);
+
     for transfer in transfers {
-        debug!("Queueing manifest: {}", transfer.path.display());
+        // Show current file name in progress bar
+        let file_name = transfer
+            .path
+            .file_name()
+            .map_or_else(|| transfer.path.to_string_lossy(), |n| n.to_string_lossy());
+        pb.set_prefix(file_name.to_string());
         agent
             .queue_write_manifest(&transfer.path, &transfer.manifest, transfer.mode)
             .await?;
+        pb.inc(1);
     }
 
     for path in to_delete {
-        debug!("Queueing delete: {}", path.display());
+        let file_name = path
+            .file_name()
+            .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
+        pb.set_prefix(format!("(delete) {file_name}"));
         agent.queue_delete_file(path).await?;
+        pb.inc(1);
     }
 
-    let result = agent.end_batch().await?;
+    pb.finish_and_clear();
 
-    if result.errors.is_empty() {
-        info!(
-            "Batch complete: {} operations successful",
-            result.success_count
-        );
-    } else {
-        warn!(
-            "Batch complete: {} successful, {} failed",
-            result.success_count,
-            result.errors.len()
-        );
+    let result = agent.end_batch().await?;
+    progress.finish(result.success_count, result.errors.len());
+
+    if !result.errors.is_empty() {
         for (idx, msg) in &result.errors {
             error!("  Operation {idx}: {msg}");
         }
