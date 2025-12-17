@@ -398,26 +398,47 @@ fn scan_directory(root: &PathBuf) -> Result<Vec<zsync_core::FileEntry>> {
 }
 
 fn write_file(path: &PathBuf, data: &[u8], mode: u32) -> Result<()> {
+    // Debug log to file
+    use std::io::Write as _;
+    let mut log = |msg: &str| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/zsync-agent-debug.log")
+        {
+            let _ = writeln!(f, "{}", msg);
+        }
+    };
+
+    log(&format!(
+        "write_file: path={}, mode={:o}",
+        path.display(),
+        mode
+    ));
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     std::fs::write(path, data)?;
+    log(&format!("  wrote {} bytes", data.len()));
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        eprintln!("  Setting mode {:o} on {}", mode, path.display());
+        log(&format!("  calling set_permissions with mode {:o}", mode));
         let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, perms)?;
+        log("  set_permissions returned Ok");
 
         // Verify it was set
         let actual = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+        log(&format!("  actual mode after set: {:o}", actual));
         if actual != mode {
-            eprintln!(
+            log(&format!(
                 "  WARNING: mode mismatch! wanted {:o}, got {:o}",
                 mode, actual
-            );
+            ));
         }
     }
 
