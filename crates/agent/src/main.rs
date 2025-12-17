@@ -284,11 +284,22 @@ fn handle_message<W: Write>(
         } => {
             let full_path = root.join(&path);
             eprintln!(
-                "WriteManifest: {} ({} chunks, {} bytes)",
+                "WriteManifest: {} ({} chunks, {} bytes, mode {:o})",
                 path.display(),
                 manifest.chunks.len(),
-                manifest.size
+                manifest.size,
+                mode
             );
+
+            // Debug log to file
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/zsync-agent-debug.log")
+            {
+                let _ = writeln!(f, "WriteManifest: path={}, mode={:o}", path.display(), mode);
+            }
 
             // Assemble file from CAS chunks
             let data = cas.assemble(&manifest.chunks)?;
