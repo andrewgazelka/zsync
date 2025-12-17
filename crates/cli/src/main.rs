@@ -152,6 +152,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Initialize progress UI (detects Ghostty terminal for OSC 9;4 progress protocol)
+    progress::init();
+
     // Setup logging with ProgressWriter to coordinate with indicatif progress bars.
     // This prevents the display corruption issue where progress bar spinner characters
     // would scatter across the terminal when mixed with tracing output.
@@ -314,10 +317,30 @@ async fn transfer_files_cas(
     if chunks_to_send.is_empty() {
         progress::SyncProgress::chunks_deduped();
     } else {
-        // Show spinner for chunk upload (can't track real progress since it's one network call)
-        let spinner = progress::SyncProgress::upload_spinner(total_chunk_bytes);
+        // Show progress bar for chunk upload
+        // Note: store_chunks is a single network call, so we show total bytes and file count
+        let upload_bar = progress::SyncProgress::upload_bar(total_chunk_bytes);
+
+        // Show summary of files being uploaded
+        let file_summary = if transfers.len() == 1 {
+            transfers[0]
+                .path
+                .file_name()
+                .map_or_else(
+                    || transfers[0].path.to_string_lossy(),
+                    |n| n.to_string_lossy(),
+                )
+                .to_string()
+        } else {
+            format!("{} files", transfers.len())
+        };
+        upload_bar.set_current_file(&file_summary);
+
         agent.store_chunks(&chunks_to_send).await?;
-        spinner.finish_and_clear();
+
+        // Mark complete (all bytes transferred)
+        upload_bar.add_bytes(total_chunk_bytes);
+        upload_bar.finish();
     }
 
     // Send file manifests and deletes in a batch

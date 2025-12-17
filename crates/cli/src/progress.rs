@@ -3,20 +3,59 @@
 //! Displays progress in the familiar cargo format:
 //! ```text
 //!    Checking 14808 unique chunks across 952 files...
-//!   Uploading 67.44 MiB ⠋
+//!   Uploading [=========>           ] 45% 30.2 MiB/67.4 MiB src/main.rs
 //!     Syncing [===========>             ] 500/952 src/main.rs
 //!      Synced 952 files in 3.2s
 //! ```
 //!
 //! Uses `indicatif::MultiProgress` to coordinate all terminal output and prevent
 //! display corruption from concurrent stderr writes.
+//!
+//! ## Ghostty Terminal Progress Protocol
+//!
+//! When running in Ghostty terminal (detected via `TERM_PROGRAM=ghostty` or
+//! `GHOSTTY_RESOURCES_DIR` env var), zsync emits OSC 9;4 escape sequences to
+//! show progress in the terminal tab/title bar.
 
+use std::io::Write as _;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Global MultiProgress instance for coordinating all terminal output.
 /// All progress bars and status messages go through this to prevent display corruption.
 static MULTI: OnceLock<indicatif::MultiProgress> = OnceLock::new();
+
+/// Whether we're running in Ghostty terminal (supports OSC 9;4 progress protocol)
+static IS_GHOSTTY: AtomicBool = AtomicBool::new(false);
+
+/// Initialize Ghostty detection. Call once at startup.
+pub fn init() {
+    let is_ghostty = std::env::var("TERM_PROGRAM")
+        .map(|v| v.eq_ignore_ascii_case("ghostty"))
+        .unwrap_or(false)
+        || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok();
+
+    IS_GHOSTTY.store(is_ghostty, Ordering::Relaxed);
+}
+
+/// Set Ghostty tab progress (0-100). Only emits if running in Ghostty.
+fn set_ghostty_progress(percent: u8) {
+    if IS_GHOSTTY.load(Ordering::Relaxed) {
+        // OSC 9;4;1;{percent} ST - Set progress bar (1 = normal progress)
+        let _ = write!(std::io::stderr(), "\x1b]9;4;1;{percent}\x1b\\");
+        let _ = std::io::stderr().flush();
+    }
+}
+
+/// Clear Ghostty tab progress. Only emits if running in Ghostty.
+fn clear_ghostty_progress() {
+    if IS_GHOSTTY.load(Ordering::Relaxed) {
+        // OSC 9;4;0;0 ST - Clear progress bar (0 = remove)
+        let _ = write!(std::io::stderr(), "\x1b]9;4;0;0\x1b\\");
+        let _ = std::io::stderr().flush();
+    }
+}
 
 fn multi() -> &'static indicatif::MultiProgress {
     MULTI.get_or_init(indicatif::MultiProgress::new)
@@ -70,6 +109,34 @@ fn print_status(status: &str, message: &str) {
     multi().println(line).ok();
 }
 
+/// Progress bar for chunk uploads with byte-level tracking
+pub struct UploadProgress {
+    bar: indicatif::ProgressBar,
+    total_bytes: u64,
+}
+
+impl UploadProgress {
+    /// Set which file is currently being uploaded (shown as dim suffix)
+    pub fn set_current_file(&self, file_name: &str) {
+        self.bar.set_prefix(file_name.to_string());
+    }
+
+    /// Add bytes to the progress (call as chunks are uploaded)
+    pub fn add_bytes(&self, bytes: u64) {
+        self.bar.inc(bytes);
+
+        // Update Ghostty progress
+        let percent = (self.bar.position() * 100 / self.total_bytes.max(1)) as u8;
+        set_ghostty_progress(percent.min(100));
+    }
+
+    /// Mark upload as complete
+    pub fn finish(self) {
+        self.bar.finish_and_clear();
+        clear_ghostty_progress();
+    }
+}
+
 /// Progress tracker for the sync operation
 pub struct SyncProgress {
     start: Instant,
@@ -90,24 +157,31 @@ impl SyncProgress {
         );
     }
 
-    /// Create a spinner for chunk upload (can't track real progress)
-    #[expect(
-        clippy::literal_string_with_formatting_args,
-        reason = "indicatif template syntax"
-    )]
-    pub fn upload_spinner(total_bytes: u64) -> indicatif::ProgressBar {
-        let pb = multi().add(indicatif::ProgressBar::new_spinner());
-        let size_str = humansize::format_size(total_bytes, humansize::BINARY);
+    /// Create a progress bar for chunk uploads with byte tracking
+    ///
+    /// Returns an `UploadProgress` which tracks bytes uploaded and can display
+    /// which file's chunks are currently being processed.
+    pub fn upload_bar(total_bytes: u64) -> UploadProgress {
+        let pb = multi().add(indicatif::ProgressBar::new(total_bytes));
         pb.set_style(
-            indicatif::ProgressStyle::default_spinner()
-                // Format: "   Uploading 67.44 MiB ⠋" (spinner at end, status right-aligned)
-                .template("{msg:>12} {prefix} {spinner:.green}")
-                .expect("valid template"),
+            indicatif::ProgressStyle::default_bar()
+                // Format: "   Uploading [====>       ] 45% 30.2/67.4 MiB src/main.rs"
+                .template(
+                    "{msg:>12} [{bar:20.cyan/dim}] {percent:>3}% {binary_bytes}/{binary_total_bytes} {prefix:.dim}",
+                )
+                .expect("valid template")
+                .progress_chars("=> "),
         );
         pb.set_message(Status::UPLOADING);
-        pb.set_prefix(size_str);
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
-        pb
+
+        // Set initial Ghostty progress
+        set_ghostty_progress(0);
+
+        UploadProgress {
+            bar: pb,
+            total_bytes,
+        }
     }
 
     /// Show "All chunks already on server" message
