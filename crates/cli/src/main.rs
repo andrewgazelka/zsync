@@ -152,11 +152,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Setup logging
+    // Setup logging with ProgressWriter to coordinate with indicatif progress bars.
+    // This prevents the display corruption issue where progress bar spinner characters
+    // would scatter across the terminal when mixed with tracing output.
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(progress::ProgressWriter)
         .init();
 
     match cli.command {
@@ -294,7 +297,7 @@ async fn transfer_files_cas(
     }
 
     let all_hashes: Vec<ContentHash> = all_chunks.keys().copied().collect();
-    progress.checking(all_hashes.len(), transfers.len());
+    progress::SyncProgress::checking(all_hashes.len(), transfers.len());
 
     // Ask server which chunks are missing
     let missing_hashes = agent.check_chunks(&all_hashes).await?;
@@ -309,10 +312,10 @@ async fn transfer_files_cas(
     let total_chunk_bytes: u64 = chunks_to_send.iter().map(|(_, d)| d.len() as u64).sum();
 
     if chunks_to_send.is_empty() {
-        progress.chunks_deduped();
+        progress::SyncProgress::chunks_deduped();
     } else {
         // Show spinner for chunk upload (can't track real progress since it's one network call)
-        let spinner = progress.upload_spinner(total_chunk_bytes);
+        let spinner = progress::SyncProgress::upload_spinner(total_chunk_bytes);
         agent.store_chunks(&chunks_to_send).await?;
         spinner.finish_and_clear();
     }
@@ -322,7 +325,7 @@ async fn transfer_files_cas(
     agent.start_batch(total_ops as u32).await?;
 
     // Show progress bar for file syncing
-    let pb = progress.file_sync_bar(total_ops);
+    let pb = progress::SyncProgress::file_sync_bar(total_ops);
 
     for transfer in transfers {
         // Show current file name in progress bar

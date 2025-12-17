@@ -3,13 +3,55 @@
 //! Displays progress in the familiar cargo format:
 //! ```text
 //!    Checking 14808 unique chunks across 952 files...
-//!   Uploading [======>                  ] 67.44 MiB
+//!   Uploading 67.44 MiB ⠋
 //!     Syncing [===========>             ] 500/952 src/main.rs
 //!      Synced 952 files in 3.2s
 //! ```
+//!
+//! Uses `indicatif::MultiProgress` to coordinate all terminal output and prevent
+//! display corruption from concurrent stderr writes.
 
-use std::io::Write as _;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Global MultiProgress instance for coordinating all terminal output.
+/// All progress bars and status messages go through this to prevent display corruption.
+static MULTI: OnceLock<indicatif::MultiProgress> = OnceLock::new();
+
+fn multi() -> &'static indicatif::MultiProgress {
+    MULTI.get_or_init(indicatif::MultiProgress::new)
+}
+
+/// A writer that coordinates with the global MultiProgress.
+/// Use this with tracing-subscriber to ensure logs don't corrupt progress bar display.
+#[derive(Clone)]
+pub struct ProgressWriter;
+
+impl std::io::Write for ProgressWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Convert to string and print through MultiProgress
+        if let Ok(s) = std::str::from_utf8(buf) {
+            // Strip trailing newline since println adds one
+            let s = s.trim_end_matches('\n');
+            if !s.is_empty() {
+                multi().println(s).ok();
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ProgressWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// Status verbs for cargo-style output (right-aligned to 12 chars)
 struct Status;
@@ -21,11 +63,11 @@ impl Status {
     const SKIPPED: &str = "Skipped";
 }
 
-/// Print a cargo-style status line
+/// Print a cargo-style status line, coordinated with any active progress bars
 fn print_status(status: &str, message: &str) {
-    let mut term = console::Term::stderr();
     let style = console::Style::new().green().bold();
-    let _ = writeln!(term, "{:>12} {}", style.apply_to(status), message);
+    let line = format!("{:>12} {}", style.apply_to(status), message);
+    multi().println(line).ok();
 }
 
 /// Progress tracker for the sync operation
@@ -41,7 +83,7 @@ impl SyncProgress {
     }
 
     /// Show the initial "Checking X chunks across Y files" message
-    pub fn checking(&self, chunks: usize, files: usize) {
+    pub fn checking(chunks: usize, files: usize) {
         print_status(
             Status::CHECKING,
             &format!("{chunks} unique chunks across {files} files..."),
@@ -49,22 +91,27 @@ impl SyncProgress {
     }
 
     /// Create a spinner for chunk upload (can't track real progress)
-    pub fn upload_spinner(&self, total_bytes: u64) -> indicatif::ProgressBar {
-        let pb = indicatif::ProgressBar::new_spinner();
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "indicatif template syntax"
+    )]
+    pub fn upload_spinner(total_bytes: u64) -> indicatif::ProgressBar {
+        let pb = multi().add(indicatif::ProgressBar::new_spinner());
         let size_str = humansize::format_size(total_bytes, humansize::BINARY);
         pb.set_style(
             indicatif::ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg:>12} {prefix}")
+                // Format: "   Uploading 67.44 MiB ⠋" (spinner at end, status right-aligned)
+                .template("{msg:>12} {prefix} {spinner:.green}")
                 .expect("valid template"),
         );
         pb.set_message(Status::UPLOADING);
-        pb.set_prefix(format!("{size_str}..."));
+        pb.set_prefix(size_str);
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
         pb
     }
 
     /// Show "All chunks already on server" message
-    pub fn chunks_deduped(&self) {
+    pub fn chunks_deduped() {
         print_status(
             Status::SKIPPED,
             "all chunks already on server (deduplication win!)",
@@ -72,12 +119,12 @@ impl SyncProgress {
     }
 
     /// Create a progress bar for file syncing
-    pub fn file_sync_bar(&self, total_files: u64) -> indicatif::ProgressBar {
-        let pb = indicatif::ProgressBar::new(total_files);
+    pub fn file_sync_bar(total_files: u64) -> indicatif::ProgressBar {
+        let pb = multi().add(indicatif::ProgressBar::new(total_files));
         pb.set_style(
             indicatif::ProgressStyle::default_bar()
                 .template(
-                    "{spinner:.green} {msg:>12} [{bar:25.cyan/dim}] {pos}/{len} {prefix:.dim}",
+                    "{msg:>12} [{bar:25.cyan/dim}] {pos}/{len} {prefix:.dim} {spinner:.green}",
                 )
                 .expect("valid template")
                 .progress_chars("=> "),
@@ -102,16 +149,15 @@ impl SyncProgress {
                 &format!("{success_count} files in {elapsed_str}"),
             );
         } else {
-            let mut term = console::Term::stderr();
             let style = console::Style::new().yellow().bold();
-            let _ = writeln!(
-                term,
+            let line = format!(
                 "{:>12} {} successful, {} failed in {}",
                 style.apply_to("Finished"),
                 success_count,
                 error_count,
                 elapsed_str
             );
+            multi().println(line).ok();
         }
     }
 }
