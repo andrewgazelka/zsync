@@ -61,37 +61,6 @@ fn multi() -> &'static indicatif::MultiProgress {
     MULTI.get_or_init(indicatif::MultiProgress::new)
 }
 
-/// A writer that coordinates with the global MultiProgress.
-/// Use this with tracing-subscriber to ensure logs don't corrupt progress bar display.
-#[derive(Clone)]
-pub struct ProgressWriter;
-
-impl std::io::Write for ProgressWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Convert to string and print through MultiProgress
-        if let Ok(s) = std::str::from_utf8(buf) {
-            // Strip trailing newline since println adds one
-            let s = s.trim_end_matches('\n');
-            if !s.is_empty() {
-                multi().println(s).ok();
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::stderr().flush()
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ProgressWriter {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// Status verbs for cargo-style output (right-aligned to 12 chars)
 struct Status;
 
