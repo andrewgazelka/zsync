@@ -396,8 +396,18 @@ fn write_file(path: &PathBuf, data: &[u8], mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        eprintln!("  Setting mode {:o} on {}", mode, path.display());
         let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, perms)?;
+
+        // Verify it was set
+        let actual = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+        if actual != mode {
+            eprintln!(
+                "  WARNING: mode mismatch! wanted {:o}, got {:o}",
+                mode, actual
+            );
+        }
     }
 
     #[cfg(not(unix))]
