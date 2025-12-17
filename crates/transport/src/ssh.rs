@@ -366,23 +366,48 @@ impl AgentSession {
 
     /// Store chunks on the server
     pub async fn store_chunks(&mut self, chunks: &[(ContentHash, Bytes)]) -> Result<()> {
-        // Build payload: count(4) + (hash(32) + len(4) + data)*count
+        self.store_chunks_with_progress(chunks, |_| {}).await
+    }
+
+    /// Store chunks on the server with progress callback.
+    ///
+    /// The callback is invoked after each chunk is sent with the number of bytes
+    /// transferred in that chunk. This allows real-time progress tracking during upload.
+    pub async fn store_chunks_with_progress<F>(
+        &mut self,
+        chunks: &[(ContentHash, Bytes)],
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64),
+    {
+        // Calculate total payload length: count(4) + (hash(32) + len(4) + data)*count
         let payload_len: usize = 4 + chunks
             .iter()
             .map(|(_, data)| 32 + 4 + data.len())
             .sum::<usize>();
 
-        let mut msg = Vec::with_capacity(5 + payload_len);
-        msg.push(protocol::msg::STORE_CHUNKS);
-        msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        msg.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
-        for (hash, data) in chunks {
-            msg.extend_from_slice(hash.as_bytes());
-            msg.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            msg.extend_from_slice(data);
-        }
+        // Send header: type(1) + length(4) + count(4)
+        let mut header = Vec::with_capacity(9);
+        header.push(protocol::msg::STORE_CHUNKS);
+        header.extend_from_slice(&(payload_len as u32).to_be_bytes());
+        header.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+        self.send(&header).await?;
 
-        self.send(&msg).await?;
+        // Stream each chunk individually for progress tracking
+        for (hash, data) in chunks {
+            // Build chunk header: hash(32) + len(4)
+            let mut chunk_header = Vec::with_capacity(36);
+            chunk_header.extend_from_slice(hash.as_bytes());
+            chunk_header.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            self.send(&chunk_header).await?;
+
+            // Send chunk data
+            self.send(data).await?;
+
+            // Report progress: header (36 bytes) + data
+            on_progress(36 + data.len() as u64);
+        }
 
         match self.read_message().await? {
             Message::Ok => Ok(()),

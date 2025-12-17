@@ -317,9 +317,11 @@ async fn transfer_files_cas(
     if chunks_to_send.is_empty() {
         progress::SyncProgress::chunks_deduped();
     } else {
-        // Show progress bar for chunk upload
-        // Note: store_chunks is a single network call, so we show total bytes and file count
-        let upload_bar = progress::SyncProgress::upload_bar(total_chunk_bytes);
+        // Calculate total bytes including protocol overhead (36 bytes header per chunk)
+        let total_wire_bytes = total_chunk_bytes + (chunks_to_send.len() as u64 * 36);
+
+        // Show progress bar for chunk upload with streaming progress
+        let upload_bar = progress::SyncProgress::upload_bar(total_wire_bytes);
 
         // Show summary of files being uploaded
         let file_summary = if transfers.len() == 1 {
@@ -336,10 +338,13 @@ async fn transfer_files_cas(
         };
         upload_bar.set_current_file(&file_summary);
 
-        agent.store_chunks(&chunks_to_send).await?;
+        // Stream chunks with real-time progress updates
+        agent
+            .store_chunks_with_progress(&chunks_to_send, |bytes| {
+                upload_bar.add_bytes(bytes);
+            })
+            .await?;
 
-        // Mark complete (all bytes transferred)
-        upload_bar.add_bytes(total_chunk_bytes);
         upload_bar.finish();
     }
 
