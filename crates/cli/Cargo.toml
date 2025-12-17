@@ -12,7 +12,8 @@ path = "src/main.rs"
 [dependencies]
 color-eyre.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-appender = "0.2"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,6 +29,7 @@ console.workspace = true
 zsync-core = { path = "../core" }
 zsync-transport = { path = "../transport" }
 bytes.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

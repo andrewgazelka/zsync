@@ -54,6 +54,7 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Read exact number of bytes from channel
+    #[tracing::instrument(skip(self, buf), fields(want = buf.len()))]
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         let mut offset = 0;
 
@@ -63,48 +64,79 @@ impl AgentSession {
             buf[..drain_len].copy_from_slice(&self.buffer[..drain_len]);
             self.buffer.drain(..drain_len);
             offset = drain_len;
+            tracing::trace!("drained {} bytes from buffer", drain_len);
         }
 
         // Then read from channel
         while offset < buf.len() {
+            tracing::trace!(
+                "waiting for channel data: need {} more bytes (have {}/{})",
+                buf.len() - offset,
+                offset,
+                buf.len()
+            );
             match self.channel.wait().await {
                 Some(ChannelMsg::Data { data }) => {
                     let bytes = data.as_ref();
                     let to_copy = (buf.len() - offset).min(bytes.len());
                     buf[offset..offset + to_copy].copy_from_slice(&bytes[..to_copy]);
                     offset += to_copy;
+                    tracing::trace!(
+                        "received {} bytes from channel, copied {}, offset now {}",
+                        bytes.len(),
+                        to_copy,
+                        offset
+                    );
 
                     // Buffer any extra
                     if to_copy < bytes.len() {
                         self.buffer.extend_from_slice(&bytes[to_copy..]);
+                        tracing::trace!("buffered {} extra bytes", bytes.len() - to_copy);
                     }
                 }
                 Some(ChannelMsg::Eof | ChannelMsg::Close) => {
+                    tracing::warn!("channel closed unexpectedly while reading");
                     return Err(color_eyre::eyre::eyre!("Channel closed unexpectedly"));
                 }
-                Some(_) => {}
+                Some(msg) => {
+                    tracing::trace!(
+                        "ignoring channel message: {:?}",
+                        std::mem::discriminant(&msg)
+                    );
+                }
                 None => {
+                    tracing::warn!("channel returned None");
                     return Err(color_eyre::eyre::eyre!("Channel closed"));
                 }
             }
         }
 
+        tracing::trace!("read_exact complete: {} bytes", buf.len());
         Ok(())
     }
 
     /// Read a message from the agent
+    #[tracing::instrument(skip(self))]
     async fn read_message(&mut self) -> Result<Message> {
+        tracing::trace!("read_message: waiting for header");
         // Read header: type (1 byte) + length (4 bytes)
         let mut header = [0u8; 5];
         self.read_exact(&mut header).await?;
 
         let msg_type = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        tracing::trace!(
+            "read_message: header received, type=0x{:02x}, payload_len={}",
+            msg_type,
+            len
+        );
 
         // Read payload
         let mut payload = vec![0u8; len];
         if len > 0 {
+            tracing::trace!("read_message: reading {} byte payload", len);
             self.read_exact(&mut payload).await?;
+            tracing::trace!("read_message: payload received");
         }
 
         // Parse based on type
@@ -138,8 +170,11 @@ impl AgentSession {
     }
 
     /// Send raw bytes to agent
+    #[tracing::instrument(skip(self, data), fields(len = data.len()))]
     async fn send(&self, data: &[u8]) -> Result<()> {
+        tracing::trace!("sending {} bytes to agent", data.len());
         self.channel.data(data).await?;
+        tracing::trace!("sent {} bytes successfully", data.len());
         Ok(())
     }
 
@@ -373,6 +408,7 @@ impl AgentSession {
     ///
     /// The callback is invoked after each chunk is sent with the number of bytes
     /// transferred in that chunk. This allows real-time progress tracking during upload.
+    #[tracing::instrument(skip(self, chunks, on_progress), fields(chunk_count = chunks.len()))]
     pub async fn store_chunks_with_progress<F>(
         &mut self,
         chunks: &[(ContentHash, Bytes)],
@@ -387,30 +423,52 @@ impl AgentSession {
             .map(|(_, data)| 32 + 4 + data.len())
             .sum::<usize>();
 
+        tracing::debug!(
+            "store_chunks_with_progress: {} chunks, {} bytes total payload",
+            chunks.len(),
+            payload_len
+        );
+
         // Send header: type(1) + length(4) + count(4)
         let mut header = Vec::with_capacity(9);
         header.push(protocol::msg::STORE_CHUNKS);
         header.extend_from_slice(&(payload_len as u32).to_be_bytes());
         header.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+        tracing::trace!("sending STORE_CHUNKS header: 9 bytes");
         self.send(&header).await?;
+        tracing::trace!("STORE_CHUNKS header sent");
 
         // Stream each chunk individually for progress tracking
-        for (hash, data) in chunks {
+        for (idx, (hash, data)) in chunks.iter().enumerate() {
+            tracing::trace!(
+                "sending chunk {}/{}: hash={}, {} bytes",
+                idx + 1,
+                chunks.len(),
+                hash,
+                data.len()
+            );
+
             // Build chunk header: hash(32) + len(4)
             let mut chunk_header = Vec::with_capacity(36);
             chunk_header.extend_from_slice(hash.as_bytes());
             chunk_header.extend_from_slice(&(data.len() as u32).to_be_bytes());
             self.send(&chunk_header).await?;
+            tracing::trace!("chunk {} header sent", idx + 1);
 
             // Send chunk data
             self.send(data).await?;
+            tracing::trace!("chunk {} data sent", idx + 1);
 
             // Report progress: header (36 bytes) + data
             on_progress(36 + data.len() as u64);
         }
 
+        tracing::debug!("all chunks sent, waiting for server response");
         match self.read_message().await? {
-            Message::Ok => Ok(()),
+            Message::Ok => {
+                tracing::debug!("store_chunks_with_progress: server acknowledged OK");
+                Ok(())
+            }
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Store chunks failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
         }

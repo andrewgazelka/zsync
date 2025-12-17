@@ -7,6 +7,7 @@
 //! - Pure Rust SSH transport
 //! - File watching with debouncing
 
+mod debug_log;
 mod embedded_agents;
 mod progress;
 
@@ -155,15 +156,19 @@ async fn main() -> Result<()> {
     // Initialize progress UI (detects Ghostty terminal for OSC 9;4 progress protocol)
     progress::init();
 
-    // Setup logging with ProgressWriter to coordinate with indicatif progress bars.
-    // This prevents the display corruption issue where progress bar spinner characters
-    // would scatter across the terminal when mixed with tracing output.
-    let filter = if cli.verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(progress::ProgressWriter)
-        .init();
+    // Initialize combined logging: file (detailed trace) + console (through MultiProgress)
+    // The guard must be kept alive for the log file to be written
+    let session = debug_log::init(cli.verbose);
+
+    // Show log file path at startup (direct eprintln, not through tracing)
+    eprintln!(
+        "{}  Debug log: {}",
+        console::style("Trace").cyan().bold(),
+        session.log_path.display()
+    );
+
+    // Keep the guard alive
+    let _log_guard = session.guard;
 
     match cli.command {
         Commands::Version => {
