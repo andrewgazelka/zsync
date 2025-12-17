@@ -56,11 +56,13 @@ impl Snapshot {
         let mut removed = Vec::new();
         let mut modified = Vec::new();
 
-        // Find added and modified files
+        // Find added and modified files (content or permissions changed)
         for (path, new_entry) in &other.files {
             match self.files.get(path) {
                 None => added.push(path.clone()),
-                Some(old_entry) if old_entry.hash != new_entry.hash => {
+                Some(old_entry)
+                    if old_entry.hash != new_entry.hash || old_entry.mode != new_entry.mode =>
+                {
                     modified.push(path.clone());
                 }
                 _ => {}
@@ -124,7 +126,7 @@ mod tests {
             size: content.len() as u64,
             modified: SystemTime::now(),
             hash: ContentHash::from_bytes(content),
-            executable: false,
+            mode: 0o644,
         }
     }
 

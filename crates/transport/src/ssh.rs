@@ -157,10 +157,10 @@ impl AgentSession {
     }
 
     /// Write a file to the remote
-    pub async fn write_file(&mut self, path: &Path, data: &[u8], executable: bool) -> Result<()> {
-        // Build payload: path_len(2) + path + executable(1) + data
+    pub async fn write_file(&mut self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        // Build payload: path_len(2) + path + mode(4) + data
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let payload_len = 2 + path_bytes.len() + 1 + data.len();
+        let payload_len = 2 + path_bytes.len() + 4 + data.len();
 
         // Header
         let mut msg = Vec::with_capacity(5 + payload_len);
@@ -171,8 +171,8 @@ impl AgentSession {
         msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
         msg.extend_from_slice(&path_bytes);
 
-        // Executable flag
-        msg.push(u8::from(executable));
+        // Mode
+        msg.extend_from_slice(&mode.to_be_bytes());
 
         // Data
         msg.extend_from_slice(data);
@@ -232,21 +232,16 @@ impl AgentSession {
     }
 
     /// Queue a file write in batch mode (no ACK until end_batch)
-    pub async fn queue_write_file(
-        &mut self,
-        path: &Path,
-        data: &[u8],
-        executable: bool,
-    ) -> Result<()> {
+    pub async fn queue_write_file(&mut self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let payload_len = 2 + path_bytes.len() + 1 + data.len();
+        let payload_len = 2 + path_bytes.len() + 4 + data.len();
 
         let mut msg = Vec::with_capacity(5 + payload_len);
         msg.push(protocol::msg::WRITE_FILE);
         msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
         msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
         msg.extend_from_slice(&path_bytes);
-        msg.push(u8::from(executable));
+        msg.extend_from_slice(&mode.to_be_bytes());
         msg.extend_from_slice(data);
 
         self.send(&msg).await
@@ -267,21 +262,16 @@ impl AgentSession {
     }
 
     /// Queue a delta write in batch mode (no ACK until end_batch)
-    pub async fn queue_write_delta(
-        &mut self,
-        path: &Path,
-        delta: &[u8],
-        executable: bool,
-    ) -> Result<()> {
+    pub async fn queue_write_delta(&mut self, path: &Path, delta: &[u8], mode: u32) -> Result<()> {
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let payload_len = 2 + path_bytes.len() + 1 + 4 + delta.len();
+        let payload_len = 2 + path_bytes.len() + 4 + 4 + delta.len();
 
         let mut msg = Vec::with_capacity(5 + payload_len);
         msg.push(protocol::msg::WRITE_DELTA);
         msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
         msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
         msg.extend_from_slice(&path_bytes);
-        msg.push(u8::from(executable));
+        msg.extend_from_slice(&mode.to_be_bytes());
         msg.extend_from_slice(&(delta.len() as u32).to_be_bytes());
         msg.extend_from_slice(delta);
 
@@ -328,16 +318,16 @@ impl AgentSession {
     }
 
     /// Write a file using delta transfer
-    pub async fn write_delta(&mut self, path: &Path, delta: &[u8], executable: bool) -> Result<()> {
+    pub async fn write_delta(&mut self, path: &Path, delta: &[u8], mode: u32) -> Result<()> {
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let payload_len = 2 + path_bytes.len() + 1 + 4 + delta.len();
+        let payload_len = 2 + path_bytes.len() + 4 + 4 + delta.len();
 
         let mut msg = Vec::with_capacity(5 + payload_len);
         msg.push(protocol::msg::WRITE_DELTA);
         msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
         msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
         msg.extend_from_slice(&path_bytes);
-        msg.push(u8::from(executable));
+        msg.extend_from_slice(&mode.to_be_bytes());
         msg.extend_from_slice(&(delta.len() as u32).to_be_bytes());
         msg.extend_from_slice(delta);
 
@@ -406,18 +396,18 @@ impl AgentSession {
         &mut self,
         path: &Path,
         manifest: &FileManifest,
-        executable: bool,
+        mode: u32,
     ) -> Result<()> {
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        // path_len(2) + path + executable(1) + file_hash(32) + size(8) + chunk_count(4) + hashes
-        let payload_len = 2 + path_bytes.len() + 1 + 32 + 8 + 4 + manifest.chunks.len() * 32;
+        // path_len(2) + path + mode(4) + file_hash(32) + size(8) + chunk_count(4) + hashes
+        let payload_len = 2 + path_bytes.len() + 4 + 32 + 8 + 4 + manifest.chunks.len() * 32;
 
         let mut msg = Vec::with_capacity(5 + payload_len);
         msg.push(protocol::msg::WRITE_MANIFEST);
         msg.extend_from_slice(&(payload_len as u32).to_be_bytes());
         msg.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
         msg.extend_from_slice(&path_bytes);
-        msg.push(u8::from(executable));
+        msg.extend_from_slice(&mode.to_be_bytes());
         msg.extend_from_slice(manifest.file_hash.as_bytes());
         msg.extend_from_slice(&manifest.size.to_be_bytes());
         msg.extend_from_slice(&(manifest.chunks.len() as u32).to_be_bytes());
@@ -510,17 +500,17 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
         cursor.read_exact(&mut hash_buf)?;
         let hash = ContentHash::from_raw(hash_buf);
 
-        // Executable
-        let mut exec_buf = [0u8; 1];
-        cursor.read_exact(&mut exec_buf)?;
-        let executable = exec_buf[0] != 0;
+        // Mode
+        let mut mode_buf = [0u8; 4];
+        cursor.read_exact(&mut mode_buf)?;
+        let mode = u32::from_be_bytes(mode_buf);
 
         entries.push(FileEntry {
             path,
             size,
             modified: std::time::SystemTime::UNIX_EPOCH,
             hash,
-            executable,
+            mode,
         });
     }
 

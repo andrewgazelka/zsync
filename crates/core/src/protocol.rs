@@ -140,13 +140,13 @@ impl<W: Write> ProtocolWriter<W> {
     }
 
     /// Send write file request
-    pub fn send_write_file(&mut self, path: &Path, data: &[u8], executable: bool) -> Result<()> {
+    pub fn send_write_file(&mut self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
         let path_encoded = encode_path(path);
-        let payload_len = path_encoded.len() + 1 + data.len();
+        let payload_len = path_encoded.len() + 4 + data.len();
 
         write_header(&mut self.inner, msg::WRITE_FILE, payload_len as u32)?;
         self.inner.write_all(&path_encoded)?;
-        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&mode.to_be_bytes())?;
         self.inner.write_all(data)?;
         self.inner.flush()?;
         Ok(())
@@ -248,12 +248,12 @@ impl<W: Write> ProtocolWriter<W> {
     }
 
     /// Send delta write (compressed delta data)
-    pub fn send_write_delta(&mut self, path: &Path, delta: &[u8], executable: bool) -> Result<()> {
+    pub fn send_write_delta(&mut self, path: &Path, delta: &[u8], mode: u32) -> Result<()> {
         let path_encoded = encode_path(path);
-        let payload_len = path_encoded.len() + 1 + 4 + delta.len();
+        let payload_len = path_encoded.len() + 4 + 4 + delta.len();
         write_header(&mut self.inner, msg::WRITE_DELTA, payload_len as u32)?;
         self.inner.write_all(&path_encoded)?;
-        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&mode.to_be_bytes())?;
         self.inner.write_all(&(delta.len() as u32).to_be_bytes())?;
         self.inner.write_all(delta)?;
         self.inner.flush()?;
@@ -261,18 +261,13 @@ impl<W: Write> ProtocolWriter<W> {
     }
 
     /// Send write file without flushing (for batch operations)
-    pub fn send_write_file_no_flush(
-        &mut self,
-        path: &Path,
-        data: &[u8],
-        executable: bool,
-    ) -> Result<()> {
+    pub fn send_write_file_no_flush(&mut self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
         let path_encoded = encode_path(path);
-        let payload_len = path_encoded.len() + 1 + data.len();
+        let payload_len = path_encoded.len() + 4 + data.len();
 
         write_header(&mut self.inner, msg::WRITE_FILE, payload_len as u32)?;
         self.inner.write_all(&path_encoded)?;
-        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&mode.to_be_bytes())?;
         self.inner.write_all(data)?;
         // No flush - caller will flush after batch
         Ok(())
@@ -292,13 +287,13 @@ impl<W: Write> ProtocolWriter<W> {
         &mut self,
         path: &Path,
         delta: &[u8],
-        executable: bool,
+        mode: u32,
     ) -> Result<()> {
         let path_encoded = encode_path(path);
-        let payload_len = path_encoded.len() + 1 + 4 + delta.len();
+        let payload_len = path_encoded.len() + 4 + 4 + delta.len();
         write_header(&mut self.inner, msg::WRITE_DELTA, payload_len as u32)?;
         self.inner.write_all(&path_encoded)?;
-        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&mode.to_be_bytes())?;
         self.inner.write_all(&(delta.len() as u32).to_be_bytes())?;
         self.inner.write_all(delta)?;
         // No flush
@@ -354,14 +349,14 @@ impl<W: Write> ProtocolWriter<W> {
         &mut self,
         path: &Path,
         manifest: &FileManifest,
-        executable: bool,
+        mode: u32,
     ) -> Result<()> {
         let path_encoded = encode_path(path);
-        // path_len(2) + path + executable(1) + file_hash(32) + size(8) + chunk_count(4) + hashes
-        let payload_len = path_encoded.len() + 1 + 32 + 8 + 4 + manifest.chunks.len() * 32;
+        // path_len(2) + path + mode(4) + file_hash(32) + size(8) + chunk_count(4) + hashes
+        let payload_len = path_encoded.len() + 4 + 32 + 8 + 4 + manifest.chunks.len() * 32;
         write_header(&mut self.inner, msg::WRITE_MANIFEST, payload_len as u32)?;
         self.inner.write_all(&path_encoded)?;
-        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&mode.to_be_bytes())?;
         self.inner.write_all(manifest.file_hash.as_bytes())?;
         self.inner.write_all(&manifest.size.to_be_bytes())?;
         self.inner
@@ -378,13 +373,13 @@ impl<W: Write> ProtocolWriter<W> {
         &mut self,
         path: &Path,
         manifest: &FileManifest,
-        executable: bool,
+        mode: u32,
     ) -> Result<()> {
         let path_encoded = encode_path(path);
-        let payload_len = path_encoded.len() + 1 + 32 + 8 + 4 + manifest.chunks.len() * 32;
+        let payload_len = path_encoded.len() + 4 + 32 + 8 + 4 + manifest.chunks.len() * 32;
         write_header(&mut self.inner, msg::WRITE_MANIFEST, payload_len as u32)?;
         self.inner.write_all(&path_encoded)?;
-        self.inner.write_all(&[u8::from(executable)])?;
+        self.inner.write_all(&mode.to_be_bytes())?;
         self.inner.write_all(manifest.file_hash.as_bytes())?;
         self.inner.write_all(&manifest.size.to_be_bytes())?;
         self.inner
@@ -415,7 +410,7 @@ pub enum Message {
     WriteFile {
         path: PathBuf,
         data: Vec<u8>,
-        executable: bool,
+        mode: u32,
     },
     DeleteFile {
         path: PathBuf,
@@ -448,7 +443,7 @@ pub enum Message {
         path: PathBuf,
         /// Compressed delta data
         delta: Vec<u8>,
-        executable: bool,
+        mode: u32,
     },
     // CAS (Content-Addressable Storage) operations
     /// Client asks server which chunks are missing
@@ -467,7 +462,7 @@ pub enum Message {
     WriteManifest {
         path: PathBuf,
         manifest: FileManifest,
-        executable: bool,
+        mode: u32,
     },
 }
 
@@ -498,21 +493,17 @@ impl<R: Read> ProtocolReader<R> {
 
             msg::WRITE_FILE => {
                 let path = decode_path(&mut self.inner)?;
-                let mut exec_buf = [0u8; 1];
-                self.inner.read_exact(&mut exec_buf)?;
-                let executable = exec_buf[0] != 0;
+                let mut mode_buf = [0u8; 4];
+                self.inner.read_exact(&mut mode_buf)?;
+                let mode = u32::from_be_bytes(mode_buf);
 
                 // Remaining bytes are data
                 let path_len = 2 + path.to_string_lossy().len();
-                let data_len = len as usize - path_len - 1;
+                let data_len = len as usize - path_len - 4;
                 let mut data = vec![0u8; data_len];
                 self.inner.read_exact(&mut data)?;
 
-                Ok(Message::WriteFile {
-                    path,
-                    data,
-                    executable,
-                })
+                Ok(Message::WriteFile { path, data, mode })
             }
 
             msg::DELETE_FILE => {
@@ -593,9 +584,9 @@ impl<R: Read> ProtocolReader<R> {
 
             msg::WRITE_DELTA => {
                 let path = decode_path(&mut self.inner)?;
-                let mut exec_buf = [0u8; 1];
-                self.inner.read_exact(&mut exec_buf)?;
-                let executable = exec_buf[0] != 0;
+                let mut mode_buf = [0u8; 4];
+                self.inner.read_exact(&mut mode_buf)?;
+                let mode = u32::from_be_bytes(mode_buf);
 
                 let mut delta_len_buf = [0u8; 4];
                 self.inner.read_exact(&mut delta_len_buf)?;
@@ -604,11 +595,7 @@ impl<R: Read> ProtocolReader<R> {
                 let mut delta = vec![0u8; delta_len];
                 self.inner.read_exact(&mut delta)?;
 
-                Ok(Message::WriteDelta {
-                    path,
-                    delta,
-                    executable,
-                })
+                Ok(Message::WriteDelta { path, delta, mode })
             }
 
             // CAS operations
@@ -669,9 +656,9 @@ impl<R: Read> ProtocolReader<R> {
             msg::WRITE_MANIFEST => {
                 let path = decode_path(&mut self.inner)?;
 
-                let mut exec_buf = [0u8; 1];
-                self.inner.read_exact(&mut exec_buf)?;
-                let executable = exec_buf[0] != 0;
+                let mut mode_buf = [0u8; 4];
+                self.inner.read_exact(&mut mode_buf)?;
+                let mode = u32::from_be_bytes(mode_buf);
 
                 let mut file_hash_buf = [0u8; 32];
                 self.inner.read_exact(&mut file_hash_buf)?;
@@ -699,7 +686,7 @@ impl<R: Read> ProtocolReader<R> {
                         size,
                         chunks,
                     },
-                    executable,
+                    mode,
                 })
             }
 
@@ -723,7 +710,7 @@ impl<R: Read> ProtocolReader<R> {
 ///   path: [u8; path_len]
 ///   size: u64
 ///   hash: [u8; 32]
-///   executable: u8
+///   mode: u32
 /// ```
 fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -743,8 +730,8 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
         // Hash (32 bytes)
         buf.extend_from_slice(entry.hash.as_bytes());
 
-        // Executable
-        buf.push(u8::from(entry.executable));
+        // Mode
+        buf.extend_from_slice(&entry.mode.to_be_bytes());
     }
 
     buf
@@ -782,17 +769,17 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
         cursor.read_exact(&mut hash_buf)?;
         let hash = ContentHash::from_raw(hash_buf);
 
-        // Executable
-        let mut exec_buf = [0u8; 1];
-        cursor.read_exact(&mut exec_buf)?;
-        let executable = exec_buf[0] != 0;
+        // Mode
+        let mut mode_buf = [0u8; 4];
+        cursor.read_exact(&mut mode_buf)?;
+        let mode = u32::from_be_bytes(mode_buf);
 
         entries.push(FileEntry {
             path,
             size,
             modified: std::time::SystemTime::UNIX_EPOCH, // Not transmitted
             hash,
-            executable,
+            mode,
         });
     }
 
@@ -812,14 +799,14 @@ mod tests {
                 size: 100,
                 modified: std::time::SystemTime::UNIX_EPOCH,
                 hash: ContentHash::from_bytes(b"test"),
-                executable: false,
+                mode: 0o644,
             },
             FileEntry {
                 path: PathBuf::from("src/main.rs"),
                 size: 500,
                 modified: std::time::SystemTime::UNIX_EPOCH,
                 hash: ContentHash::from_bytes(b"main"),
-                executable: true,
+                mode: 0o755,
             },
         ];
 
@@ -832,7 +819,7 @@ mod tests {
             let decoded_entry = decoded.files.get(path).unwrap();
             assert_eq!(entry.size, decoded_entry.size);
             assert_eq!(entry.hash, decoded_entry.hash);
-            assert_eq!(entry.executable, decoded_entry.executable);
+            assert_eq!(entry.mode, decoded_entry.mode);
         }
     }
 
@@ -843,18 +830,18 @@ mod tests {
 
         let path = Path::new("test/file.txt");
         let data = b"hello world";
-        writer.send_write_file(path, data, true).unwrap();
+        writer.send_write_file(path, data, 0o755).unwrap();
 
         let mut reader = ProtocolReader::new(Cursor::new(buf));
         match reader.read_message().unwrap() {
             Message::WriteFile {
                 path: p,
                 data: d,
-                executable: e,
+                mode: m,
             } => {
                 assert_eq!(p, path);
                 assert_eq!(d, data);
-                assert!(e);
+                assert_eq!(m, 0o755);
             }
             _ => panic!("Wrong message type"),
         }

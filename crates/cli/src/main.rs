@@ -225,7 +225,7 @@ fn scan_command(path: &PathBuf) -> Result<()> {
 struct FileTransfer {
     path: PathBuf,
     manifest: FileManifest,
-    executable: bool,
+    mode: u32,
     /// Chunks that need to be transferred (hash -> data)
     chunks: Vec<(ContentHash, Bytes)>,
 }
@@ -267,7 +267,7 @@ fn prepare_cas_transfers(
                 size: data.len() as u64,
                 chunks: chunk_hashes,
             },
-            executable: entry.executable,
+            mode: entry.mode,
             chunks: file_chunks,
         });
     }
@@ -327,7 +327,7 @@ async fn transfer_files_cas(
     for transfer in transfers {
         debug!("Queueing manifest: {}", transfer.path.display());
         agent
-            .queue_write_manifest(&transfer.path, &transfer.manifest, transfer.executable)
+            .queue_write_manifest(&transfer.path, &transfer.manifest, transfer.mode)
             .await?;
     }
 

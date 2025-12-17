@@ -151,13 +151,9 @@ fn handle_message<W: Write>(
             Ok(BatchResponse::Normal)
         }
 
-        Message::WriteFile {
-            path,
-            data,
-            executable,
-        } => {
+        Message::WriteFile { path, data, mode } => {
             let full_path = root.join(&path);
-            write_file(&full_path, &data, executable)?;
+            write_file(&full_path, &data, mode)?;
             if *batch_mode {
                 Ok(BatchResponse::BatchOp)
             } else {
@@ -242,11 +238,7 @@ fn handle_message<W: Write>(
             Ok(BatchResponse::Normal)
         }
 
-        Message::WriteDelta {
-            path,
-            delta,
-            executable,
-        } => {
+        Message::WriteDelta { path, delta, mode } => {
             let full_path = root.join(&path);
 
             // Read existing file (if any) to apply delta
@@ -255,7 +247,7 @@ fn handle_message<W: Write>(
             let computer = DeltaComputer::new();
             let new_data = computer.apply(&old_data, &delta)?;
 
-            write_file(&full_path, &new_data, executable)?;
+            write_file(&full_path, &new_data, mode)?;
 
             if *batch_mode {
                 Ok(BatchResponse::BatchOp)
@@ -288,7 +280,7 @@ fn handle_message<W: Write>(
         Message::WriteManifest {
             path,
             manifest,
-            executable,
+            mode,
         } => {
             let full_path = root.join(&path);
             eprintln!(
@@ -310,7 +302,7 @@ fn handle_message<W: Write>(
                 actual_hash
             );
 
-            write_file(&full_path, &data, executable)?;
+            write_file(&full_path, &data, mode)?;
 
             if *batch_mode {
                 Ok(BatchResponse::BatchOp)
@@ -374,19 +366,19 @@ fn scan_directory(root: &PathBuf) -> Result<Vec<zsync_core::FileEntry>> {
             let hash = ContentHash::from_file(&path)?;
 
             #[cfg(unix)]
-            let executable = {
+            let mode = {
                 use std::os::unix::fs::PermissionsExt as _;
-                metadata.permissions().mode() & 0o111 != 0
+                metadata.permissions().mode() & 0o7777
             };
             #[cfg(not(unix))]
-            let executable = false;
+            let mode = 0o644;
 
             Ok(zsync_core::FileEntry {
                 path: relative_path,
                 size: metadata.len(),
                 modified: metadata.modified()?,
                 hash,
-                executable,
+                mode,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -394,7 +386,7 @@ fn scan_directory(root: &PathBuf) -> Result<Vec<zsync_core::FileEntry>> {
     Ok(entries)
 }
 
-fn write_file(path: &PathBuf, data: &[u8], executable: bool) -> Result<()> {
+fn write_file(path: &PathBuf, data: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -402,15 +394,14 @@ fn write_file(path: &PathBuf, data: &[u8], executable: bool) -> Result<()> {
     std::fs::write(path, data)?;
 
     #[cfg(unix)]
-    if executable {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(perms.mode() | 0o111);
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, perms)?;
     }
 
     #[cfg(not(unix))]
-    let _ = executable;
+    let _ = mode;
 
     Ok(())
 }

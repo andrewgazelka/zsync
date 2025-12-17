@@ -24,8 +24,8 @@ pub struct FileEntry {
     pub modified: SystemTime,
     /// Content hash (BLAKE3)
     pub hash: ContentHash,
-    /// Whether this is executable (Unix)
-    pub executable: bool,
+    /// Unix permission mode bits (e.g., 0o755, 0o644)
+    pub mode: u32,
 }
 
 /// Scanner for directory trees with gitignore support
@@ -151,19 +151,19 @@ impl Scanner {
                     .wrap_err_with(|| format!("failed to hash {}", path.display()))?;
 
                 #[cfg(unix)]
-                let executable = {
+                let mode = {
                     use std::os::unix::fs::PermissionsExt as _;
-                    metadata.permissions().mode() & 0o111 != 0
+                    metadata.permissions().mode() & 0o7777
                 };
                 #[cfg(not(unix))]
-                let executable = false;
+                let mode = 0o644;
 
                 Ok(FileEntry {
                     path: relative_path,
                     size: metadata.len(),
                     modified: metadata.modified()?,
                     hash,
-                    executable,
+                    mode,
                 })
             })
             .collect()
@@ -201,19 +201,19 @@ impl Scanner {
                     .wrap_err_with(|| format!("failed to hash {}", path.display()))?;
 
                 #[cfg(unix)]
-                let executable = {
+                let mode = {
                     use std::os::unix::fs::PermissionsExt as _;
-                    metadata.permissions().mode() & 0o111 != 0
+                    metadata.permissions().mode() & 0o7777
                 };
                 #[cfg(not(unix))]
-                let executable = false;
+                let mode = 0o644;
 
                 Ok(FileEntry {
                     path: relative_path,
                     size: metadata.len(),
                     modified: metadata.modified()?,
                     hash,
-                    executable,
+                    mode,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
