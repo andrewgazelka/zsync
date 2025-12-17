@@ -284,22 +284,11 @@ fn handle_message<W: Write>(
         } => {
             let full_path = root.join(&path);
             eprintln!(
-                "WriteManifest: {} ({} chunks, {} bytes, mode {:o})",
+                "WriteManifest: {} ({} chunks, {} bytes)",
                 path.display(),
                 manifest.chunks.len(),
-                manifest.size,
-                mode
+                manifest.size
             );
-
-            // Debug log to file
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/zsync-agent-debug.log")
-            {
-                let _ = writeln!(f, "WriteManifest: path={}, mode={:o}", path.display(), mode);
-            }
 
             // Assemble file from CAS chunks
             let data = cas.assemble(&manifest.chunks)?;
@@ -398,47 +387,25 @@ fn scan_directory(root: &PathBuf) -> Result<Vec<zsync_core::FileEntry>> {
 }
 
 fn write_file(path: &PathBuf, data: &[u8], mode: u32) -> Result<()> {
-    // Debug log to file
-    use std::io::Write as _;
-    let mut log = |msg: &str| {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/zsync-agent-debug.log")
-        {
-            let _ = writeln!(f, "{}", msg);
-        }
-    };
-
-    log(&format!(
-        "write_file: path={}, mode={:o}",
-        path.display(),
-        mode
-    ));
-
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     std::fs::write(path, data)?;
-    log(&format!("  wrote {} bytes", data.len()));
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        log(&format!("  calling set_permissions with mode {:o}", mode));
         let perms = std::fs::Permissions::from_mode(mode);
-        std::fs::set_permissions(path, perms)?;
-        log("  set_permissions returned Ok");
-
-        // Verify it was set
-        let actual = std::fs::metadata(path)?.permissions().mode() & 0o7777;
-        log(&format!("  actual mode after set: {:o}", actual));
-        if actual != mode {
-            log(&format!(
-                "  WARNING: mode mismatch! wanted {:o}, got {:o}",
-                mode, actual
-            ));
+        // set_permissions may silently fail on some filesystems (overlay, network mounts)
+        // We log a warning but don't fail the operation
+        if let Err(e) = std::fs::set_permissions(path, perms) {
+            eprintln!(
+                "Warning: failed to set mode {:o} on {}: {}",
+                mode,
+                path.display(),
+                e
+            );
         }
     }
 
