@@ -11,7 +11,7 @@ use color_eyre::Result;
 
 use zsync_core::{
     ChunkCache, ChunkStore, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter,
-    Scanner, Snapshot,
+    Snapshot,
 };
 
 #[derive(Parser)]
@@ -145,7 +145,8 @@ fn handle_message<W: Write>(
 ) -> Result<BatchResponse> {
     match msg {
         Message::SnapshotReq => {
-            let snapshot = scan_directory(root)?;
+            let entries = scan_directory(root)?;
+            let snapshot = Snapshot::from_entries(entries);
             writer.send_snapshot_resp(&snapshot)?;
             Ok(BatchResponse::Normal)
         }
@@ -332,10 +333,65 @@ fn handle_message<W: Write>(
     }
 }
 
-fn scan_directory(root: &PathBuf) -> Result<Snapshot> {
-    let scanner = Scanner::new(root);
-    let entries = scanner.scan()?;
-    Ok(Snapshot::from_entries(entries))
+/// Scan directory without gitignore filtering.
+///
+/// The server should see ALL files on disk, regardless of gitignore.
+/// The client already did the filtering - we just need to know what exists.
+fn scan_directory(root: &PathBuf) -> Result<Vec<zsync_core::FileEntry>> {
+    use ignore::WalkBuilder;
+    use rayon::prelude::*;
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false) // Include hidden files
+        .git_ignore(false) // CRITICAL: Don't respect gitignore
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .filter_entry(|e| {
+            let name = e.file_name();
+            // Skip .git directory and .zsync directory (our internal storage)
+            name != ".git" && name != ".zsync"
+        });
+
+    let paths: Vec<_> = builder
+        .build()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            if !path.is_file() {
+                return None;
+            }
+            let relative_path = path.strip_prefix(root).ok()?.to_path_buf();
+            Some((path, relative_path))
+        })
+        .collect();
+
+    let entries: Vec<zsync_core::FileEntry> = paths
+        .into_par_iter()
+        .map(|(path, relative_path)| {
+            let metadata = std::fs::metadata(&path)?;
+            let hash = ContentHash::from_file(&path)?;
+
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt as _;
+                metadata.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+
+            Ok(zsync_core::FileEntry {
+                path: relative_path,
+                size: metadata.len(),
+                modified: metadata.modified()?,
+                hash,
+                executable,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(entries)
 }
 
 fn write_file(path: &PathBuf, data: &[u8], executable: bool) -> Result<()> {

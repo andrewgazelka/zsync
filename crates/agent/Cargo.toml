@@ -16,6 +16,8 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 serde.workspace = true
 clap.workspace = true
+ignore.workspace = true
+rayon.workspace = true
 
 zsync-core = { path = "../core" }
 
