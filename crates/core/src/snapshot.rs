@@ -62,7 +62,10 @@ impl Snapshot {
                 None => added.push(path.clone()),
                 Some(old_entry) => {
                     let hash_changed = old_entry.hash != new_entry.hash;
-                    let mode_changed = old_entry.mode != new_entry.mode;
+                    // Like git, only compare executable bit (0o111), ignore read/write perms
+                    let old_exec = old_entry.mode & 0o111;
+                    let new_exec = new_entry.mode & 0o111;
+                    let mode_changed = old_exec != new_exec;
 
                     if hash_changed || mode_changed {
                         let reason = match (hash_changed, mode_changed) {
