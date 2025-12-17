@@ -893,13 +893,15 @@ impl SshTransport {
         let remote_dir = format!(".zsync/agents/{hash_prefix}");
         let remote_path = format!("{remote_dir}/zsync-agent");
 
+        info!("Agent hash: {hash_prefix} ({} bytes)", agent_data.len());
+
         // Check if this exact agent version already exists
         let (stdout, _, _) = self
             .execute(&format!("test -x ~/{remote_path} && echo exists"))
             .await?;
 
         if stdout.contains("exists") {
-            debug!("Agent already deployed at ~/{remote_path}");
+            info!("Agent {hash_prefix} already deployed, reusing");
             let (home, _, _) = self.execute("echo $HOME").await?;
             let home = home.trim();
             let path = PathBuf::from(format!("{home}/{remote_path}"));
@@ -907,7 +909,7 @@ impl SshTransport {
             return Ok(path);
         }
 
-        info!("Deploying agent to remote host...");
+        info!("Deploying NEW agent {hash_prefix} to remote host...");
 
         // Create directory
         self.execute(&format!("mkdir -p ~/{remote_dir}")).await?;
