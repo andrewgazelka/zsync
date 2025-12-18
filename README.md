@@ -3,42 +3,23 @@
 </p>
 
 <p align="center">
-  <code>nix run github:andrewgazelka/zsync -- watch ./local user@host:/remote</code>
+  <strong>Sync code to GPU instances in seconds.</strong><br>
+  Zero remote dependencies. Native .gitignore. Content-addressed.
 </p>
 
-A modern alternative to rsync and mutagen for syncing files over SSH.
-**Your remote server needs nothing installed** — zsync auto-deploys a tiny agent via SSH.
+<p align="center">
+  <code>nix run github:andrewgazelka/zsync -- root@gpu-box:/workspace</code>
+</p>
 
-## Quick Start
+---
 
-```bash
-# One-time sync
-zsync sync ./project user@server:/home/user/project
+Working on RunPod, Lambda Labs, or any remote GPU instance? Tired of:
 
-# Watch mode (continuous sync + port forwarding)
-zsync watch ./project user@server:/workspace
-```
+- **rsync** re-uploading entire files for tiny changes
+- **mutagen** requiring a 50MB daemon and complex setup
+- **scp** having no idea what `.gitignore` is
 
-## Configuration
-
-Drop a `.zsync.toml` in your project root:
-
-```toml
-# Include files even if they're gitignored
-include = [".env", "secrets/config.yaml"]
-
-# Port forwarding (active during watch mode)
-[[forward]]
-local = 8080
-remote = 8080
-
-[[forward]]
-local = 3000
-remote = 3000
-remote_host = "api-server"  # Forward to api-server:3000 on the remote
-```
-
-**Port forwarding** happens automatically in watch mode — access remote services at `localhost:8080` without a separate SSH tunnel.
+zsync fixes this. Your remote server needs nothing installed — a 3MB agent auto-deploys via SSH.
 
 ## Install
 
@@ -50,52 +31,81 @@ nix run github:andrewgazelka/zsync
 cargo install --git https://github.com/andrewgazelka/zsync
 ```
 
+## Usage
+
+```bash
+# Sync current directory to remote
+zsync root@server:/workspace/project
+
+# Custom SSH port (common on GPU clouds)
+zsync root@server:22222:/workspace/project
+
+# Watch mode — continuous sync as you edit
+zsync root@server:/workspace/project --watch
+
+# Delete remote files not present locally
+zsync root@server:/workspace/project --delete
+```
+
 ## Why zsync?
 
-| Feature | rsync | mutagen | zsync |
-|---------|-------|---------|-------|
-| Cross-sync dedup | None | None | **Persistent CAS** |
-| Agent binary size | N/A (requires install) | ~50MB | **~3MB** |
-| Remote setup | Manual install | Auto-deploy | **Auto-deploy** |
-| Respects .gitignore | Manual flags | Ignores global | **Full support** |
-| Watch mode | External tools | Built-in | Built-in |
-| Edit → re-upload | Often whole file | Often whole file | **Only changed parts** |
-
-**Key features:**
-- **Zero remote dependencies** — Agent auto-deploys via SSH (Linux x86_64/aarch64)
-- **CAS deduplication** — Content-addressable storage ensures each chunk is only sent once, ever
-- **FastCDC chunking** — Content-defined chunking finds reusable blocks across all files
-- **Native .gitignore** — Respects your existing ignore files automatically
-- **Port forwarding** — Forward local ports to remote services through SSH
-- **Static binaries** — Works on any Linux server, no glibc version issues
+| | rsync | mutagen | zsync |
+|---|:---:|:---:|:---:|
+| **Only sends changed bytes** | ❌ Often whole file | ❌ Often whole file | ✅ FastCDC chunks |
+| **Cross-file dedup** | ❌ | ❌ | ✅ Content-addressed |
+| **Zero remote setup** | ❌ Must install | ✅ Auto-deploy | ✅ Auto-deploy |
+| **Agent size** | N/A | ~50MB | **~3MB** |
+| **Native .gitignore** | ❌ Manual flags | ❌ Partial | ✅ Full support |
+| **Watch mode** | ❌ External tools | ✅ Built-in | ✅ Built-in |
+| **Port forwarding** | ❌ | ❌ | ✅ Built-in |
 
 ## How It Works
 
+zsync uses **content-addressed storage** with **FastCDC chunking**. Files are split into variable-size chunks based on content, not position. Each chunk is identified by its BLAKE3 hash.
+
 ```mermaid
 sequenceDiagram
-    participant Local as Local Machine
-    participant Remote as Remote Server
-    participant CAS as Chunk Store
+    participant Local
+    participant Remote
 
-    Local->>Remote: Connect via SSH, deploy agent
-    Local->>Remote: Request file hashes (BLAKE3)
-    Local->>Local: Compute diff, chunk with FastCDC
-    Local->>Remote: Which chunks are missing?
-    Remote-->>Local: [hash2, hash5] missing
-    Local->>Remote: Send only missing chunks
-    Remote->>CAS: Store chunks, assemble files
+    Local->>Remote: SSH connect, auto-deploy 3MB agent
+    Local->>Remote: What files do you have? (BLAKE3 hashes)
+    Remote-->>Local: Here's my manifest
+    Local->>Local: Diff, chunk changed files with FastCDC
+    Local->>Remote: Which chunks are you missing?
+    Remote-->>Local: Just these 3 chunks
+    Local->>Remote: Here they are (deduplicated)
+    Remote->>Remote: Reassemble files from chunks
 ```
 
-Chunks are stored by BLAKE3 hash — if two files share content, those chunks exist once. Sync similar projects and unchanged code is never re-transferred.
+**Result:** If you change one line in a 10MB file, only ~4KB transfers. Sync multiple similar projects and shared code chunks are never re-sent.
 
-## Supported Platforms
+## Configuration
 
-**Local:** macOS (Apple Silicon, Intel), Linux (x86_64, aarch64)
-**Remote:** Any Linux server with SSH access
+Optional `.zsync.toml` in your project:
+
+```toml
+# Include files even if gitignored
+include = [".env", "weights/*.safetensors"]
+
+# Port forwarding (active in watch mode)
+[[forward]]
+local = 8080
+remote = 8080
+
+[[forward]]
+local = 6006    # TensorBoard
+remote = 6006
+```
+
+## Platforms
+
+**Local:** macOS (Apple Silicon, Intel), Linux
+**Remote:** Any Linux server with SSH
 
 ## Status
 
-Early development. Core sync and watch mode work. Bidirectional sync coming soon.
+Production-ready for unidirectional sync. Bidirectional sync planned.
 
 ---
 
