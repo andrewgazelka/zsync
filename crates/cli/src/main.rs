@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::builder::styling::{AnsiColor, Effects};
-use clap::{Parser, Subcommand, builder::Styles};
+use clap::{Parser, builder::Styles};
 use color_eyre::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
@@ -132,101 +132,44 @@ Features:
   • Delta sync       - only transfers what changed
   • Zero remote deps - agent binary auto-deploys via SSH
   • Fast             - BLAKE3 hashing, binary protocol
+
+Examples:
+  zsync root@host:/path              # Sync current dir to remote
+  zsync root@host:2222:/path         # With custom SSH port
+  zsync root@host:/path --watch      # Continuous sync
+  zsync root@host:/path --delete     # Delete remote files not in local
 "#)]
 struct Cli {
+    /// Remote destination (user@host:/path or user@host:port:/path)
+    remote: String,
+
+    /// Local directory path
+    #[arg(default_value = ".")]
+    local: PathBuf,
+
     /// Enable verbose logging
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     verbose: bool,
 
-    #[command(subcommand)]
-    command: Commands,
-}
+    /// Watch for changes and sync continuously
+    #[arg(short, long)]
+    watch: bool,
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Sync local directory to remote
-    Sync {
-        /// Remote destination (user@host:/path)
-        remote: String,
+    /// Delete remote files that don't exist locally (default: keep them)
+    #[arg(long)]
+    delete: bool,
 
-        /// Local directory path
-        #[arg(default_value = ".")]
-        local: PathBuf,
+    /// Force-include files even if gitignored (e.g., .env)
+    #[arg(short, long)]
+    include: Vec<String>,
 
-        /// SSH port
-        #[arg(short, long, default_value = "22")]
-        port: u16,
+    /// Debounce delay in milliseconds (for watch mode)
+    #[arg(short, long, default_value = "100")]
+    debounce: u64,
 
-        /// Force-include files even if gitignored (e.g., .env)
-        #[arg(short, long)]
-        include: Vec<String>,
-
-        /// Don't delete remote files that don't exist locally
-        #[arg(long)]
-        no_delete: bool,
-
-        /// Show what would be synced without actually syncing
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Show sync status without making changes (alias for sync --dry-run)
-    Status {
-        /// Remote destination (user@host:/path)
-        remote: String,
-
-        /// Local directory path
-        #[arg(default_value = ".")]
-        local: PathBuf,
-
-        /// SSH port
-        #[arg(short, long, default_value = "22")]
-        port: u16,
-
-        /// Force-include files even if gitignored (e.g., .env)
-        #[arg(short, long)]
-        include: Vec<String>,
-
-        /// Don't consider remote-only files as "to be deleted"
-        #[arg(long)]
-        no_delete: bool,
-    },
-
-    /// Watch and continuously sync changes
-    Watch {
-        /// Remote destination (user@host:/path)
-        remote: String,
-
-        /// Local directory path
-        #[arg(default_value = ".")]
-        local: PathBuf,
-
-        /// SSH port
-        #[arg(short, long, default_value = "22")]
-        port: u16,
-
-        /// Debounce delay in milliseconds
-        #[arg(short, long, default_value = "100")]
-        debounce: u64,
-
-        /// Force-include files even if gitignored (e.g., .env)
-        #[arg(long)]
-        include: Vec<String>,
-
-        /// Don't delete remote files that don't exist locally
-        #[arg(long)]
-        no_delete: bool,
-    },
-
-    /// Scan local directory and print snapshot
-    Scan {
-        /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-
-    /// Show version and build info
-    Version,
+    /// Show what would be synced without making changes
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[tokio::main]
@@ -252,64 +195,13 @@ async fn main() -> Result<()> {
     // Keep the guard alive
     let _log_guard = session.guard;
 
-    match cli.command {
-        Commands::Version => {
-            eprintln!("zsync {}", env!("CARGO_PKG_VERSION"));
-        }
-        Commands::Scan { path } => {
-            scan_command(&path)?;
-        }
-        Commands::Sync {
-            local,
-            remote,
-            port,
-            include,
-            no_delete,
-            dry_run,
-        } => {
-            sync_command(&local, &remote, port, &include, no_delete, dry_run).await?;
-        }
-        Commands::Status {
-            local,
-            remote,
-            port,
-            include,
-            no_delete,
-        } => {
-            // Status is just sync --dry-run
-            sync_command(&local, &remote, port, &include, no_delete, true).await?;
-        }
-        Commands::Watch {
-            local,
-            remote,
-            port,
-            debounce,
-            include,
-            no_delete,
-        } => {
-            watch_command(&local, &remote, port, debounce, &include, no_delete).await?;
-        }
-    }
+    // Parse remote destination (includes port if specified)
+    let remote = parse_remote(&cli.remote)?;
 
-    Ok(())
-}
-
-fn scan_command(path: &PathBuf) -> Result<()> {
-    info!("Scanning {}...", path.display());
-
-    let scanner = Scanner::new(path);
-    let entries = scanner.scan()?;
-    let snapshot = Snapshot::from_entries(entries);
-
-    eprintln!("Files: {}", snapshot.len());
-    let total_size: u64 = snapshot.files.values().map(|f| f.size).sum();
-    eprintln!("Total size: {total_size} bytes");
-
-    if snapshot.len() <= 20 {
-        eprintln!("\nFiles:");
-        for (path, entry) in &snapshot.files {
-            eprintln!("  {} ({} bytes)", path.display(), entry.size);
-        }
+    if cli.watch {
+        watch_command(&cli.local, &remote, cli.debounce, &cli.include, cli.delete).await?;
+    } else {
+        sync_command(&cli.local, &remote, &cli.include, cli.delete, cli.dry_run).await?;
     }
 
     Ok(())
@@ -506,7 +398,7 @@ async fn sync_once(
     local: &Path,
     agent: &mut AgentSession,
     includes: &[String],
-    no_delete: bool,
+    delete: bool,
 ) -> Result<bool> {
     // Scan local
     debug!("Scanning local directory...");
@@ -533,9 +425,9 @@ async fn sync_once(
     // Compute diff
     let diff = remote_snapshot.diff(&local_snapshot);
 
-    let deletions = if no_delete { 0 } else { diff.removed.len() };
+    let deletions = if delete { diff.removed.len() } else { 0 };
 
-    if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
+    if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && !delete) {
         progress::already_in_sync(local_snapshot.len());
         return Ok(false);
     }
@@ -591,7 +483,7 @@ async fn sync_once(
             reason
         );
     }
-    if !no_delete {
+    if delete {
         for path in &diff.removed {
             info!("  - {}", path.display());
         }
@@ -602,13 +494,13 @@ async fn sync_once(
     all_paths.extend(diff.added.iter().map(std::path::PathBuf::as_path));
     all_paths.extend(diff.modified.iter().map(|m| m.path.as_path()));
 
-    let to_delete: Vec<&Path> = if no_delete {
-        vec![]
-    } else {
+    let to_delete: Vec<&Path> = if delete {
         diff.removed
             .iter()
             .map(std::path::PathBuf::as_path)
             .collect()
+    } else {
+        vec![]
     };
 
     if !all_paths.is_empty() || !to_delete.is_empty() {
@@ -734,13 +626,17 @@ async fn connect_and_start_agent(
 #[allow(clippy::too_many_lines)]
 async fn sync_command(
     local: &PathBuf,
-    remote: &str,
-    port: u16,
+    remote: &RemoteSpec,
     includes: &[String],
-    no_delete: bool,
+    delete: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let (user, host, remote_path) = parse_remote(remote)?;
+    let RemoteSpec {
+        user,
+        host,
+        port,
+        path: remote_path,
+    } = remote;
 
     if dry_run {
         info!(
@@ -777,16 +673,16 @@ async fn sync_command(
         );
     }
 
-    let (_transport, mut agent) = connect_and_start_agent(&host, port, &user, &remote_path).await?;
+    let (_transport, mut agent) = connect_and_start_agent(host, *port, user, remote_path).await?;
 
     let remote_snapshot = agent.snapshot().await?;
     progress::checking_remote(remote_snapshot.len());
 
     // Use sync_once logic but with pre-fetched snapshots for initial sync
     let diff = remote_snapshot.diff(&local_snapshot);
-    let deletions = if no_delete { 0 } else { diff.removed.len() };
+    let deletions = if delete { diff.removed.len() } else { 0 };
 
-    if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && no_delete) {
+    if diff.is_empty() || (diff.added.is_empty() && diff.modified.is_empty() && !delete) {
         progress::already_in_sync(local_snapshot.len());
     } else {
         // Count modification reasons
@@ -840,7 +736,7 @@ async fn sync_command(
                 reason
             );
         }
-        if !no_delete {
+        if delete {
             for path in &diff.removed {
                 info!("  - {}", path.display());
             }
@@ -858,13 +754,13 @@ async fn sync_command(
         all_paths.extend(diff.added.iter().map(std::path::PathBuf::as_path));
         all_paths.extend(diff.modified.iter().map(|m| m.path.as_path()));
 
-        let to_delete: Vec<&Path> = if no_delete {
-            vec![]
-        } else {
+        let to_delete: Vec<&Path> = if delete {
             diff.removed
                 .iter()
                 .map(std::path::PathBuf::as_path)
                 .collect()
+        } else {
+            vec![]
         };
 
         if !all_paths.is_empty() || !to_delete.is_empty() {
@@ -883,13 +779,17 @@ async fn sync_command(
 
 async fn watch_command(
     local: &PathBuf,
-    remote: &str,
-    port: u16,
+    remote: &RemoteSpec,
     debounce_ms: u64,
     includes: &[String],
-    no_delete: bool,
+    delete: bool,
 ) -> Result<()> {
-    let (user, host, remote_path) = parse_remote(remote)?;
+    let RemoteSpec {
+        user,
+        host,
+        port,
+        path: remote_path,
+    } = remote;
 
     // Load .zsync.toml config
     let config = ZsyncConfig::load(local)?;
@@ -912,7 +812,7 @@ async fn watch_command(
 
     // Connect and keep connection alive
     let (mut transport, mut agent) =
-        connect_and_start_agent(&host, port, &user, &remote_path).await?;
+        connect_and_start_agent(host, *port, user, remote_path).await?;
 
     // Start port forwards from config
     let mut forward_handles = Vec::new();
@@ -928,7 +828,7 @@ async fn watch_command(
     }
 
     // Initial sync (progress output comes from sync_once/transfer_files_cas)
-    sync_once(local, &mut agent, &all_includes, no_delete).await?;
+    sync_once(local, &mut agent, &all_includes, delete).await?;
 
     // Setup file watcher
     let (tx, rx) = mpsc::channel();
@@ -973,14 +873,14 @@ async fn watch_command(
                     Err(e) => {
                         warn!("Sync failed: {e}, reconnecting...");
                         // Try to reconnect
-                        match connect_and_start_agent(&host, port, &user, &remote_path).await {
+                        match connect_and_start_agent(host, *port, user, remote_path).await {
                             Ok((new_transport, new_agent)) => {
                                 transport = new_transport;
                                 agent = new_agent;
                                 info!("Reconnected, doing full sync...");
                                 // Full sync after reconnect in case we missed events
                                 if let Err(e) =
-                                    sync_once(local, &mut agent, &all_includes, no_delete).await
+                                    sync_once(local, &mut agent, &all_includes, delete).await
                                 {
                                     error!("Sync failed after reconnect: {e}");
                                 }
@@ -1008,23 +908,62 @@ async fn watch_command(
     Ok(())
 }
 
-/// Parse remote string like "user@host:/path" into components
-fn parse_remote(remote: &str) -> Result<(String, String, String)> {
+/// Parsed remote destination
+struct RemoteSpec {
+    user: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+/// Parse remote string like "user@host:/path" or "user@host:port:/path" into components
+fn parse_remote(remote: &str) -> Result<RemoteSpec> {
     let at_pos = remote.find('@').ok_or_else(|| {
-        color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path")
+        color_eyre::eyre::eyre!(
+            "Invalid remote format, expected user@host:/path or user@host:port:/path"
+        )
     })?;
 
     let user = remote[..at_pos].to_string();
     let rest = &remote[at_pos + 1..];
 
-    let colon_pos = rest.find(':').ok_or_else(|| {
-        color_eyre::eyre::eyre!("Invalid remote format, expected user@host:/path")
-    })?;
+    // Find all colons - could be host:port:/path or host:/path
+    let colon_positions: Vec<usize> = rest.match_indices(':').map(|(i, _)| i).collect();
 
-    let host = rest[..colon_pos].to_string();
-    let path = rest[colon_pos + 1..].to_string();
+    if colon_positions.is_empty() {
+        color_eyre::eyre::bail!(
+            "Invalid remote format, expected user@host:/path or user@host:port:/path"
+        );
+    }
 
-    Ok((user, host, path))
+    let first_colon = colon_positions[0];
+    let host = rest[..first_colon].to_string();
+
+    let (port, path) = if colon_positions.len() >= 2 {
+        // Could be host:port:/path - check if first segment is numeric
+        let potential_port = &rest[first_colon + 1..colon_positions[1]];
+
+        if let Ok(port_num) = potential_port.parse::<u16>() {
+            // It's host:port:/path
+            let path = rest[colon_positions[1] + 1..].to_string();
+            (port_num, path)
+        } else {
+            // Not a port number, treat first colon as path separator (e.g., host:/path/with:colon)
+            let path = rest[first_colon + 1..].to_string();
+            (22, path)
+        }
+    } else {
+        // Only one colon: host:/path
+        let path = rest[first_colon + 1..].to_string();
+        (22, path)
+    };
+
+    Ok(RemoteSpec {
+        user,
+        host,
+        port,
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -1033,17 +972,37 @@ mod tests {
 
     #[test]
     fn test_parse_remote() {
-        let (user, host, path) = parse_remote("root@example.com:/home/user").unwrap();
-        assert_eq!(user, "root");
-        assert_eq!(host, "example.com");
-        assert_eq!(path, "/home/user");
+        let remote = parse_remote("root@example.com:/home/user").unwrap();
+        assert_eq!(remote.user, "root");
+        assert_eq!(remote.host, "example.com");
+        assert_eq!(remote.port, 22);
+        assert_eq!(remote.path, "/home/user");
+    }
+
+    #[test]
+    fn test_parse_remote_with_port() {
+        let remote = parse_remote("root@example.com:2222:/home/user").unwrap();
+        assert_eq!(remote.user, "root");
+        assert_eq!(remote.host, "example.com");
+        assert_eq!(remote.port, 2222);
+        assert_eq!(remote.path, "/home/user");
     }
 
     #[test]
     fn test_parse_remote_relative_path() {
-        let (user, host, path) = parse_remote("user@host:workspace/project").unwrap();
-        assert_eq!(user, "user");
-        assert_eq!(host, "host");
-        assert_eq!(path, "workspace/project");
+        let remote = parse_remote("user@host:workspace/project").unwrap();
+        assert_eq!(remote.user, "user");
+        assert_eq!(remote.host, "host");
+        assert_eq!(remote.port, 22);
+        assert_eq!(remote.path, "workspace/project");
+    }
+
+    #[test]
+    fn test_parse_remote_relative_path_with_port() {
+        let remote = parse_remote("user@host:10249:workspace/project").unwrap();
+        assert_eq!(remote.user, "user");
+        assert_eq!(remote.host, "host");
+        assert_eq!(remote.port, 10249);
+        assert_eq!(remote.path, "workspace/project");
     }
 }
