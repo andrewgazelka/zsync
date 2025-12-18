@@ -256,6 +256,53 @@ impl Scanner {
         paths.sort();
         Ok(paths)
     }
+
+    /// Scan only specific files (by relative path).
+    ///
+    /// This is much faster than a full scan when only a few files changed.
+    /// Files that don't exist are silently skipped.
+    ///
+    /// # Errors
+    /// Returns an error if file reading or hashing fails
+    pub fn scan_files(&self, relative_paths: &[&std::path::Path]) -> Result<Vec<FileEntry>> {
+        let entries: Vec<FileEntry> = relative_paths
+            .into_par_iter()
+            .filter_map(|relative_path| {
+                let absolute_path = self.root.join(relative_path);
+
+                // Skip if file doesn't exist (was deleted)
+                if !absolute_path.is_file() {
+                    return None;
+                }
+
+                let Ok(metadata) = std::fs::metadata(&absolute_path) else {
+                    return None;
+                };
+
+                let Ok(hash) = ContentHash::from_file(&absolute_path) else {
+                    return None;
+                };
+
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    metadata.permissions().mode() & 0o7777
+                };
+                #[cfg(not(unix))]
+                let mode = 0o644;
+
+                Some(FileEntry {
+                    path: relative_path.to_path_buf(),
+                    size: metadata.len(),
+                    modified: metadata.modified().ok()?,
+                    hash,
+                    mode,
+                })
+            })
+            .collect();
+
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]

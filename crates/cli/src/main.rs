@@ -622,6 +622,89 @@ async fn sync_once(
     Ok(true)
 }
 
+/// Sync only specific changed paths (incremental sync for watch mode).
+///
+/// This is much faster than `sync_once` because it only hashes changed files
+/// instead of rescanning the entire directory.
+async fn sync_changed_paths(
+    local: &Path,
+    agent: &mut AgentSession,
+    changed_paths: &[&Path],
+) -> Result<bool> {
+    // Convert absolute paths to relative paths and categorize
+    let mut relative_paths: Vec<&std::path::Path> = Vec::new();
+    let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
+
+    for abs_path in changed_paths {
+        // Skip paths outside our local directory
+        let Ok(rel_path) = abs_path.strip_prefix(local) else {
+            continue;
+        };
+
+        // Check if file exists (modified/added) or was deleted
+        if abs_path.is_file() {
+            relative_paths.push(rel_path);
+        } else if !abs_path.exists() {
+            // File was deleted
+            to_delete.push(rel_path.to_path_buf());
+        }
+        // Skip directories
+    }
+
+    if relative_paths.is_empty() && to_delete.is_empty() {
+        return Ok(false);
+    }
+
+    // Scan only the changed files (fast - no full directory walk)
+    let scanner = Scanner::new(local);
+    let rel_path_refs: Vec<&std::path::Path> = relative_paths.clone();
+    let entries = scanner.scan_files(&rel_path_refs)?;
+
+    if entries.is_empty() && to_delete.is_empty() {
+        return Ok(false);
+    }
+
+    // Build partial snapshot from changed files
+    let local_snapshot = Snapshot::from_entries(entries);
+
+    // Log what we're syncing
+    let sync_count = local_snapshot.len();
+    let delete_count = to_delete.len();
+
+    if sync_count > 0 {
+        for (path, entry) in &local_snapshot.files {
+            info!(
+                "  ~ {} ({})",
+                path.display(),
+                humansize::format_size(entry.size, humansize::BINARY)
+            );
+        }
+    }
+    for path in &to_delete {
+        info!("  - {}", path.display());
+    }
+
+    // Prepare CAS transfers for changed files
+    let all_paths: Vec<&Path> = local_snapshot
+        .files
+        .keys()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+
+    if !all_paths.is_empty() || !to_delete.is_empty() {
+        let transfers = prepare_cas_transfers(local, &all_paths, &local_snapshot)?;
+        let delete_refs: Vec<&Path> = to_delete.iter().map(std::path::PathBuf::as_path).collect();
+        transfer_files_cas(agent, &transfers, &delete_refs).await?;
+    }
+
+    info!(
+        "Incremental sync: {} updated, {} deleted",
+        sync_count, delete_count
+    );
+
+    Ok(true)
+}
+
 /// Connect to remote and start agent session
 async fn connect_and_start_agent(
     host: &str,
@@ -868,7 +951,13 @@ async fn watch_command(
     loop {
         match rx.recv() {
             Ok(events) => {
-                let paths: Vec<_> = events.iter().flat_map(|e| e.paths.iter()).collect();
+                // Collect unique changed paths
+                let paths: Vec<_> = events
+                    .iter()
+                    .flat_map(|e| e.paths.iter())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
 
                 if paths.is_empty() {
                     continue;
@@ -876,10 +965,11 @@ async fn watch_command(
 
                 debug!("Detected {} changed paths", paths.len());
 
-                // Sync using existing connection
-                match sync_once(local, &mut agent, &all_includes, no_delete).await {
+                // Incremental sync - only process changed files
+                let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+                match sync_changed_paths(local, &mut agent, &path_refs).await {
                     Ok(true) => {}  // Changes synced, already logged
-                    Ok(false) => {} // No actual changes, stay quiet
+                    Ok(false) => {} // No actual changes (e.g., temp files), stay quiet
                     Err(e) => {
                         warn!("Sync failed: {e}, reconnecting...");
                         // Try to reconnect
@@ -887,7 +977,8 @@ async fn watch_command(
                             Ok((new_transport, new_agent)) => {
                                 transport = new_transport;
                                 agent = new_agent;
-                                info!("Reconnected, retrying sync...");
+                                info!("Reconnected, doing full sync...");
+                                // Full sync after reconnect in case we missed events
                                 if let Err(e) =
                                     sync_once(local, &mut agent, &all_includes, no_delete).await
                                 {
