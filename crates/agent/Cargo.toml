@@ -18,6 +18,8 @@ serde.workspace = true
 clap.workspace = true
 ignore.workspace = true
 rayon.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
 
 zsync-core = { path = "../core" }
 

@@ -5,9 +5,12 @@
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
+use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
+use tokio::sync::mpsc;
 
 use zsync_core::{
     ChunkCache, ChunkStore, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter,
@@ -29,6 +32,9 @@ enum Commands {
         /// Root directory to sync
         #[arg(short, long)]
         root: PathBuf,
+        /// Enable file watching for bidirectional sync
+        #[arg(short, long)]
+        watch: bool,
     },
     /// Print version and exit
     Version,
@@ -43,14 +49,214 @@ fn main() -> Result<()> {
         Commands::Version => {
             eprintln!("zsync-agent {}", env!("CARGO_PKG_VERSION"));
         }
-        Commands::Daemon { root } => {
-            run_daemon(&root)?;
+        Commands::Daemon { root, watch } => {
+            if watch {
+                // Run async with file watching
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(run_daemon_watch(&root))?;
+            } else {
+                // Run sync (legacy mode)
+                run_daemon(&root)?;
+            }
         }
     }
 
     Ok(())
 }
 
+/// Run daemon with file watching for bidirectional sync
+async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
+    eprintln!(
+        "zsync-agent daemon starting (watch mode), root: {}",
+        root.display()
+    );
+
+    // Ensure root directory exists
+    std::fs::create_dir_all(root)?;
+
+    // Initialize chunk cache and CAS
+    let cache_path = root.join(".zsync").join("cache");
+    let cache = ChunkCache::open(&cache_path)?;
+    eprintln!("Chunk cache initialized at {}", cache_path.display());
+
+    let cas_path = root.join(".zsync").join("cas");
+    let cas = ChunkStore::open(&cas_path)?;
+    eprintln!("CAS chunk store initialized at {}", cas_path.display());
+
+    // Set up file watcher
+    let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<DebouncedEvent>>(100);
+    let root_clone = root.clone();
+
+    let mut debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache> = new_debouncer(
+        Duration::from_millis(200),
+        None,
+        move |result: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| {
+            if let Ok(events) = result {
+                // Filter out .zsync directory changes
+                let filtered: Vec<_> = events
+                    .into_iter()
+                    .filter(|e| {
+                        !e.paths.iter().any(|p| {
+                            p.strip_prefix(&root_clone)
+                                .map(|rel| rel.starts_with(".zsync") || rel.starts_with(".git"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .collect();
+
+                if !filtered.is_empty() {
+                    let _ = watch_tx.blocking_send(filtered);
+                }
+            }
+        },
+    )?;
+
+    // Start watching
+    debouncer.watch(root.as_path(), notify::RecursiveMode::Recursive)?;
+    eprintln!("File watcher started");
+
+    // Channels for communication between threads
+    let (msg_tx, mut msg_rx) = mpsc::channel::<Result<Message>>(100);
+    let (write_tx, write_rx) = std::sync::mpsc::channel::<WriteCommand>();
+
+    // Spawn blocking I/O thread that owns both stdin and stdout
+    let root_for_io = root.clone();
+    let cache_for_io = cache;
+    let cas_for_io = cas;
+    std::thread::spawn(move || {
+        run_io_thread(root_for_io, msg_tx, write_rx, cache_for_io, cas_for_io);
+    });
+
+    loop {
+        tokio::select! {
+            // Handle protocol messages
+            Some(msg_result) = msg_rx.recv() => {
+                match msg_result {
+                    Ok(msg) => {
+                        let should_shutdown = matches!(msg, Message::Shutdown);
+
+                        // Send message to IO thread for handling
+                        let cmd = WriteCommand::HandleMessage { msg };
+                        if write_tx.send(cmd).is_err() {
+                            break;
+                        }
+
+                        if should_shutdown {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Read error (likely EOF): {e}");
+                        break;
+                    }
+                }
+            }
+
+            // Handle file change events
+            Some(events) = watch_rx.recv() => {
+                eprintln!("File changes detected: {} events", events.len());
+                for event in &events {
+                    eprintln!("  {:?}: {:?}", event.kind, event.paths);
+                }
+
+                // Send change notification to client
+                if write_tx.send(WriteCommand::ChangeNotify).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    eprintln!("zsync-agent daemon shutting down");
+    Ok(())
+}
+
+/// Commands sent to the I/O thread
+enum WriteCommand {
+    HandleMessage { msg: Message },
+    ChangeNotify,
+}
+
+/// I/O thread that owns stdin/stdout and handles protocol messages
+fn run_io_thread(
+    root: PathBuf,
+    msg_tx: mpsc::Sender<Result<Message>>,
+    write_rx: std::sync::mpsc::Receiver<WriteCommand>,
+    cache: ChunkCache,
+    cas: ChunkStore,
+) {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+
+    // We need to handle stdin in a separate thread since it blocks
+    // But stdout can be handled in this thread
+    let mut writer = ProtocolWriter::new(BufWriter::new(stdout.lock()));
+
+    let mut batch_mode = false;
+    let mut batch_errors: Vec<(u32, String)> = Vec::new();
+    let mut batch_index: u32 = 0;
+    let mut batch_success: u32 = 0;
+
+    // Spawn reader in a separate thread - it will send messages via channel
+    std::thread::spawn(move || {
+        let mut reader = ProtocolReader::new(BufReader::new(stdin.lock()));
+        loop {
+            let msg = reader.read_message();
+            let is_err = msg.is_err();
+            if msg_tx.blocking_send(msg).is_err() || is_err {
+                break;
+            }
+        }
+    });
+
+    // Handle write commands
+    while let Ok(cmd) = write_rx.recv() {
+        match cmd {
+            WriteCommand::HandleMessage { msg } => {
+                let should_shutdown = matches!(msg, Message::Shutdown);
+
+                match handle_message(&root, msg, &mut writer, &mut batch_mode, &cache, &cas) {
+                    Ok(BatchResponse::Normal) => {}
+                    Ok(BatchResponse::BatchStarted) => {
+                        batch_errors.clear();
+                        batch_index = 0;
+                        batch_success = 0;
+                    }
+                    Ok(BatchResponse::BatchEnded) => {
+                        if let Err(e) = writer.send_batch_result(batch_success, &batch_errors) {
+                            eprintln!("Error sending batch result: {e}");
+                        }
+                        batch_mode = false;
+                    }
+                    Ok(BatchResponse::BatchOp) => {
+                        batch_success += 1;
+                        batch_index += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Error handling message: {e}");
+                        if batch_mode {
+                            batch_errors.push((batch_index, e.to_string()));
+                            batch_index += 1;
+                        } else {
+                            let _ = writer.send_error(&e.to_string());
+                        }
+                    }
+                }
+
+                if should_shutdown {
+                    break;
+                }
+            }
+            WriteCommand::ChangeNotify => {
+                if let Err(e) = writer.send_change_notify() {
+                    eprintln!("Error sending change notify: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Run daemon in legacy sync mode (no file watching)
 fn run_daemon(root: &PathBuf) -> Result<()> {
     eprintln!("zsync-agent daemon starting, root: {}", root.display());
 
@@ -310,6 +516,12 @@ fn handle_message<W: Write>(
                 writer.send_ok()?;
                 Ok(BatchResponse::Normal)
             }
+        }
+
+        // Bidirectional messages - agent shouldn't receive these
+        Message::ChangeNotify => {
+            writer.send_error("Agent received ChangeNotify (should only be sent by agent)")?;
+            Ok(BatchResponse::Normal)
         }
 
         // These are responses, not requests - shouldn't receive them

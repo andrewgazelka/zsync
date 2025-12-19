@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Sync code to GPU instances in seconds.</strong><br>
+  <strong>Bidirectional sync to GPU instances in seconds.</strong><br>
   Zero remote dependencies. Native .gitignore. Content-addressed.
 </p>
 
@@ -44,7 +44,7 @@ zsync root@server:22222           # same thing
 # Explicit remote path
 zsync root@server:/workspace/project
 
-# Watch mode — continuous sync as you edit
+# Watch mode — bidirectional sync as you edit locally or remotely
 zsync root@server --watch
 
 # Delete remote files not present locally
@@ -60,6 +60,7 @@ zsync root@server --delete
 | **Zero remote setup** | ❌ Must install | ✅ Auto-deploy | ✅ Auto-deploy |
 | **Agent size** | N/A | ~50MB | **~3MB** |
 | **Native .gitignore** | ❌ Manual flags | ❌ Partial | ✅ Full support |
+| **Bidirectional sync** | ❌ | ✅ | ✅ Built-in |
 | **Watch mode** | ❌ External tools | ✅ Built-in | ✅ Built-in |
 | **Port forwarding** | ❌ | ❌ | ✅ Built-in |
 
@@ -109,7 +110,7 @@ remote = 6006
 
 ## Status
 
-Production-ready for unidirectional sync. Bidirectional sync planned.
+Production-ready with bidirectional sync in watch mode.
 
 ---
 

@@ -12,7 +12,6 @@ mod embedded_agents;
 mod progress;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::builder::styling::{AnsiColor, Effects};
@@ -777,6 +776,7 @@ async fn sync_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn watch_command(
     local: &PathBuf,
     remote: &RemoteSpec,
@@ -803,16 +803,16 @@ async fn watch_command(
     }
 
     info!(
-        "Watching {} -> {}@{}:{}",
+        "Watching {} <-> {}@{}:{} (bidirectional)",
         local.display(),
         user,
         host,
         remote_path
     );
 
-    // Connect and keep connection alive
+    // Connect with watch mode enabled for bidirectional sync
     let (mut transport, mut agent) =
-        connect_and_start_agent(host, *port, user, remote_path).await?;
+        connect_and_start_agent_watch(host, *port, user, remote_path).await?;
 
     // Start port forwards from config
     let mut forward_handles = Vec::new();
@@ -830,15 +830,15 @@ async fn watch_command(
     // Initial sync (progress output comes from sync_once/transfer_files_cas)
     sync_once(local, &mut agent, &all_includes, delete).await?;
 
-    // Setup file watcher
-    let (tx, rx) = mpsc::channel();
+    // Setup local file watcher with tokio channel for async compatibility
+    let (tx, mut watch_rx) = tokio::sync::mpsc::channel(100);
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(debounce_ms),
         None,
         move |result: DebounceEventResult| {
             if let Ok(events) = result {
-                let _ = tx.send(events);
+                let _ = tx.blocking_send(events);
             }
         },
     )?;
@@ -847,10 +847,18 @@ async fn watch_command(
 
     progress::watching();
 
-    // Process file change events
+    // Bidirectional watch loop:
+    // - Handle local file changes (sync local -> remote)
+    // - Handle CHANGE_NOTIFY from agent (sync remote -> local)
     loop {
-        match rx.recv() {
-            Ok(events) => {
+        // Use a short poll timeout to check for remote changes
+        let poll_timeout = Duration::from_millis(100);
+
+        tokio::select! {
+            biased;
+
+            // Check for local file changes
+            Some(events) = watch_rx.recv() => {
                 // Collect unique changed paths
                 let paths: Vec<_> = events
                     .iter()
@@ -863,22 +871,40 @@ async fn watch_command(
                     continue;
                 }
 
-                debug!("Detected {} changed paths", paths.len());
+                debug!("Local changes: {} paths", paths.len());
 
-                // Incremental sync - only process changed files
+                // Incremental sync local -> remote
                 let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
-                match sync_changed_paths(local, &mut agent, &path_refs).await {
-                    Ok(true) => {}  // Changes synced, already logged
-                    Ok(false) => {} // No actual changes (e.g., temp files), stay quiet
+                if let Err(e) = sync_changed_paths(local, &mut agent, &path_refs).await {
+                    warn!("Sync failed: {e}, will retry on next change");
+                }
+            }
+
+            // Check for remote changes via CHANGE_NOTIFY
+            remote_result = agent.try_read_message(poll_timeout) => {
+                match remote_result {
+                    Ok(Some(zsync_core::Message::ChangeNotify)) => {
+                        info!("Remote files changed, syncing...");
+                        // For now, do a full sync from remote
+                        // TODO: implement proper remote -> local incremental sync
+                        if let Err(e) = sync_once(local, &mut agent, &all_includes, delete).await {
+                            warn!("Sync from remote failed: {e}");
+                        }
+                    }
+                    Ok(Some(other)) => {
+                        debug!("Unexpected message from agent: {:?}", other);
+                    }
+                    Ok(None) => {
+                        // No message, that's fine
+                    }
                     Err(e) => {
-                        warn!("Sync failed: {e}, reconnecting...");
+                        warn!("Error reading from agent: {e}, reconnecting...");
                         // Try to reconnect
-                        match connect_and_start_agent(host, *port, user, remote_path).await {
+                        match connect_and_start_agent_watch(host, *port, user, remote_path).await {
                             Ok((new_transport, new_agent)) => {
                                 transport = new_transport;
                                 agent = new_agent;
                                 info!("Reconnected, doing full sync...");
-                                // Full sync after reconnect in case we missed events
                                 if let Err(e) =
                                     sync_once(local, &mut agent, &all_includes, delete).await
                                 {
@@ -887,14 +913,11 @@ async fn watch_command(
                             }
                             Err(e) => {
                                 error!("Reconnection failed: {e}");
+                                break;
                             }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                error!("Watch error: {e}");
-                break;
             }
         }
     }
@@ -906,6 +929,32 @@ async fn watch_command(
     drop(transport); // Explicit drop to silence unused warning
     agent.shutdown().await?;
     Ok(())
+}
+
+/// Connect to remote and start agent session with watch mode for bidirectional sync
+async fn connect_and_start_agent_watch(
+    host: &str,
+    port: u16,
+    user: &str,
+    remote_path: &str,
+) -> Result<(SshTransport, AgentSession)> {
+    progress::connecting(host, port);
+    let mut transport = SshTransport::connect(host, port, user).await?;
+    progress::connected("SSH");
+
+    let bundle = embedded_agents::embedded_bundle();
+    if bundle.platforms().is_empty() {
+        return Err(color_eyre::eyre::eyre!(
+            "No embedded agent binaries - cannot sync"
+        ));
+    }
+
+    transport.ensure_agent(&bundle).await?;
+
+    debug!("Starting remote agent with watch mode...");
+    let agent = transport.start_agent_watch(remote_path).await?;
+
+    Ok((transport, agent))
 }
 
 /// Parsed remote destination

@@ -12,10 +12,11 @@ use russh::keys::{PublicKey, load_secret_key};
 use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::Platform;
 use crate::agent::AgentBundle;
+use crate::{AgentSessionTrait, BatchOperationResult, Platform};
 use zsync_core::{ContentHash, FileManifest, Message, Snapshot, protocol};
 
 /// SSH transport for communicating with remote hosts
@@ -165,8 +166,38 @@ impl AgentSession {
                 let hashes = decode_missing_chunks(&payload)?;
                 Ok(Message::MissingChunks { hashes })
             }
+            protocol::msg::CHANGE_NOTIFY => Ok(Message::ChangeNotify),
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }
+    }
+
+    /// Try to read a message with a timeout.
+    /// Returns None if no message is available within the timeout.
+    /// This is used to poll for server-initiated messages like CHANGE_NOTIFY.
+    pub async fn try_read_message(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Message>> {
+        tokio::select! {
+            biased;
+
+            result = self.read_message() => {
+                Ok(Some(result?))
+            }
+            () = tokio::time::sleep(timeout) => {
+                Ok(None)
+            }
+        }
+    }
+
+    /// Wait for either a message from the agent or a timeout.
+    /// Returns the message if one arrives, or None on timeout.
+    ///
+    /// This is the main method for bidirectional watch mode - it allows
+    /// the CLI to wait for CHANGE_NOTIFY from the agent while also
+    /// being able to handle local file changes via tokio::select!.
+    pub async fn wait_for_message(&mut self) -> Result<Message> {
+        self.read_message().await
     }
 
     /// Send raw bytes to agent
@@ -314,14 +345,14 @@ impl AgentSession {
     }
 
     /// End the batch and get results
-    pub async fn end_batch(&mut self) -> Result<BatchResult> {
+    pub async fn end_batch(&mut self) -> Result<BatchOperationResult> {
         self.send(&[protocol::msg::BATCH_END, 0, 0, 0, 0]).await?;
 
         match self.read_message().await? {
             Message::BatchResult {
                 success_count,
                 errors,
-            } => Ok(BatchResult {
+            } => Ok(BatchOperationResult {
                 success_count,
                 errors,
             }),
@@ -502,11 +533,60 @@ impl AgentSession {
     }
 }
 
-/// Result of a batch operation
-#[derive(Debug)]
-pub struct BatchResult {
-    pub success_count: u32,
-    pub errors: Vec<(u32, String)>,
+#[async_trait]
+impl AgentSessionTrait for AgentSession {
+    async fn snapshot(&mut self) -> Result<Snapshot> {
+        Self::snapshot(self).await
+    }
+
+    async fn write_file(&mut self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        Self::write_file(self, path, data, mode).await
+    }
+
+    async fn delete_file(&mut self, path: &Path) -> Result<()> {
+        Self::delete_file(self, path).await
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        Self::shutdown(self).await
+    }
+
+    fn root(&self) -> &Path {
+        Self::root(self)
+    }
+
+    async fn start_batch(&mut self, count: u32) -> Result<()> {
+        Self::start_batch(self, count).await
+    }
+
+    async fn queue_write_file(&mut self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        Self::queue_write_file(self, path, data, mode).await
+    }
+
+    async fn queue_delete_file(&mut self, path: &Path) -> Result<()> {
+        Self::queue_delete_file(self, path).await
+    }
+
+    async fn queue_write_manifest(
+        &mut self,
+        path: &Path,
+        manifest: &FileManifest,
+        mode: u32,
+    ) -> Result<()> {
+        Self::queue_write_manifest(self, path, manifest, mode).await
+    }
+
+    async fn end_batch(&mut self) -> Result<BatchOperationResult> {
+        Self::end_batch(self).await
+    }
+
+    async fn check_chunks(&mut self, hashes: &[ContentHash]) -> Result<Vec<ContentHash>> {
+        Self::check_chunks(self, hashes).await
+    }
+
+    async fn store_chunks(&mut self, chunks: &[(ContentHash, Bytes)]) -> Result<()> {
+        Self::store_chunks(self, chunks).await
+    }
 }
 
 /// Simple glob matching for SSH host patterns
@@ -552,6 +632,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// Decode snapshot from binary (same format as protocol.rs)
 fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
     use std::io::{Cursor, Read};
+    use std::time::{Duration, UNIX_EPOCH};
     use zsync_core::{ContentHash, FileEntry};
 
     let mut cursor = Cursor::new(data);
@@ -588,10 +669,20 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
         cursor.read_exact(&mut mode_buf)?;
         let mode = u32::from_be_bytes(mode_buf);
 
+        // Modification time (seconds since UNIX epoch)
+        let mut mtime_buf = [0u8; 8];
+        cursor.read_exact(&mut mtime_buf)?;
+        let mtime_secs = i64::from_be_bytes(mtime_buf);
+        let modified = if mtime_secs >= 0 {
+            UNIX_EPOCH + Duration::from_secs(mtime_secs as u64)
+        } else {
+            UNIX_EPOCH - Duration::from_secs((-mtime_secs) as u64)
+        };
+
         entries.push(FileEntry {
             path,
             size,
-            modified: std::time::SystemTime::UNIX_EPOCH,
+            modified,
             hash,
             mode,
         });
@@ -1033,15 +1124,26 @@ impl SshTransport {
 
     /// Start the agent process on the remote host and return a session
     pub async fn start_agent(&self, root: &str) -> Result<AgentSession> {
+        self.start_agent_internal(root, false).await
+    }
+
+    /// Start the agent process with file watching enabled for bidirectional sync
+    pub async fn start_agent_watch(&self, root: &str) -> Result<AgentSession> {
+        self.start_agent_internal(root, true).await
+    }
+
+    /// Internal method to start agent with or without watch mode
+    async fn start_agent_internal(&self, root: &str, watch: bool) -> Result<AgentSession> {
         let agent_path = self.agent_path.as_ref().ok_or_else(|| {
             color_eyre::eyre::eyre!("Agent not deployed - call ensure_agent first")
         })?;
 
         let channel = self.session.channel_open_session().await?;
+        let watch_flag = if watch { " --watch" } else { "" };
         channel
             .exec(
                 true,
-                format!("{} daemon --root {root}", agent_path.display()),
+                format!("{} daemon --root {root}{watch_flag}", agent_path.display()),
             )
             .await?;
 

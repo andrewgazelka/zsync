@@ -69,6 +69,8 @@ pub mod msg {
     pub const MISSING_CHUNKS: u8 = 0x31;
     pub const STORE_CHUNKS: u8 = 0x32;
     pub const WRITE_MANIFEST: u8 = 0x33;
+    // Bidirectional sync - server-initiated messages
+    pub const CHANGE_NOTIFY: u8 = 0x40;
 }
 
 /// Write a frame header (type + length)
@@ -396,6 +398,13 @@ impl<W: Write> ProtocolWriter<W> {
         Ok(())
     }
 
+    /// Send change notify - server tells client files have changed
+    pub fn send_change_notify(&mut self) -> Result<()> {
+        write_header(&mut self.inner, msg::CHANGE_NOTIFY, 0)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
     /// Get inner writer
     pub fn into_inner(self) -> W {
         self.inner
@@ -464,6 +473,9 @@ pub enum Message {
         manifest: FileManifest,
         mode: u32,
     },
+    // Bidirectional sync messages
+    /// Server notifies client that files have changed (no payload)
+    ChangeNotify,
 }
 
 /// Protocol reader for receiving messages
@@ -690,6 +702,8 @@ impl<R: Read> ProtocolReader<R> {
                 })
             }
 
+            msg::CHANGE_NOTIFY => Ok(Message::ChangeNotify),
+
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }
     }
@@ -711,8 +725,11 @@ impl<R: Read> ProtocolReader<R> {
 ///   size: u64
 ///   hash: [u8; 32]
 ///   mode: u32
+///   mtime_secs: i64 (seconds since UNIX epoch)
 /// ```
 fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    use std::time::UNIX_EPOCH;
+
     let mut buf = Vec::new();
 
     // File count
@@ -732,6 +749,14 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
 
         // Mode
         buf.extend_from_slice(&entry.mode.to_be_bytes());
+
+        // Modification time (seconds since UNIX epoch)
+        let mtime_secs = entry
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        buf.extend_from_slice(&mtime_secs.to_be_bytes());
     }
 
     buf
@@ -740,6 +765,8 @@ fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
 /// Decode snapshot from binary
 fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
     use std::io::Cursor;
+    use std::time::{Duration, UNIX_EPOCH};
+
     let mut cursor = Cursor::new(data);
 
     // File count
@@ -774,10 +801,21 @@ fn decode_snapshot(data: &[u8]) -> Result<Snapshot> {
         cursor.read_exact(&mut mode_buf)?;
         let mode = u32::from_be_bytes(mode_buf);
 
+        // Modification time (seconds since UNIX epoch)
+        let mut mtime_buf = [0u8; 8];
+        cursor.read_exact(&mut mtime_buf)?;
+        let mtime_secs = i64::from_be_bytes(mtime_buf);
+        let modified = if mtime_secs >= 0 {
+            UNIX_EPOCH + Duration::from_secs(mtime_secs as u64)
+        } else {
+            // Handle pre-epoch times (rare but possible)
+            UNIX_EPOCH - Duration::from_secs((-mtime_secs) as u64)
+        };
+
         entries.push(FileEntry {
             path,
             size,
-            modified: std::time::SystemTime::UNIX_EPOCH, // Not transmitted
+            modified,
             hash,
             mode,
         });
@@ -793,18 +831,24 @@ mod tests {
 
     #[test]
     fn test_snapshot_roundtrip() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Use specific timestamps to verify mtime is transmitted
+        let mtime1 = UNIX_EPOCH + Duration::from_secs(1_700_000_000); // ~2023
+        let mtime2 = UNIX_EPOCH + Duration::from_secs(1_600_000_000); // ~2020
+
         let entries = vec![
             FileEntry {
                 path: PathBuf::from("test.txt"),
                 size: 100,
-                modified: std::time::SystemTime::UNIX_EPOCH,
+                modified: mtime1,
                 hash: ContentHash::from_bytes(b"test"),
                 mode: 0o644,
             },
             FileEntry {
                 path: PathBuf::from("src/main.rs"),
                 size: 500,
-                modified: std::time::SystemTime::UNIX_EPOCH,
+                modified: mtime2,
                 hash: ContentHash::from_bytes(b"main"),
                 mode: 0o755,
             },
@@ -820,6 +864,14 @@ mod tests {
             assert_eq!(entry.size, decoded_entry.size);
             assert_eq!(entry.hash, decoded_entry.hash);
             assert_eq!(entry.mode, decoded_entry.mode);
+            // Verify mtime is correctly transmitted (within 1 second due to precision)
+            let orig_secs = entry.modified.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let decoded_secs = decoded_entry
+                .modified
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(orig_secs, decoded_secs, "mtime should match for {path:?}");
         }
     }
 
