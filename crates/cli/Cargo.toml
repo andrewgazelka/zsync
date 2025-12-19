@@ -20,6 +20,7 @@ serde_json.workspace = true
 clap.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
+ignore.workspace = true
 dirs.workspace = true
 zstd.workspace = true
 humansize.workspace = true

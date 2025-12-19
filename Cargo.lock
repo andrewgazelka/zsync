@@ -4434,6 +4434,7 @@ dependencies = [
  "console",
  "dirs",
  "humansize",
+ "ignore",
  "indicatif",
  "notify",
  "notify-debouncer-full",

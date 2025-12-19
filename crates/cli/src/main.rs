@@ -17,6 +17,7 @@ use std::time::Duration;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, builder::Styles};
 use color_eyre::Result;
+use ignore::gitignore::GitignoreBuilder;
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tracing::{debug, error, info, warn};
@@ -81,7 +82,7 @@ async fn execute_manifest_batches(
                     manifest,
                     mode,
                 } => {
-                    progress::syncing_file(path, manifest.size);
+                    progress::syncing_file(path, manifest.size, progress::SyncDirection::Upload);
                     agent.queue_write_manifest(path, manifest, *mode).await?;
                 }
                 ManifestOp::Delete { path } => {
@@ -845,6 +846,27 @@ async fn watch_command(
 
     debouncer.watch(local, RecursiveMode::Recursive)?;
 
+    // Build gitignore matcher to filter watched files
+    // This prevents syncing target/, node_modules/, etc.
+    let gitignore = {
+        let mut builder = GitignoreBuilder::new(local);
+        // Add .gitignore if it exists
+        let gitignore_path = local.join(".gitignore");
+        if gitignore_path.exists() {
+            builder.add(&gitignore_path);
+        }
+        // Add global gitignore
+        if let Some(home) = dirs::home_dir() {
+            let global_gitignore = home.join(".config/git/ignore");
+            if global_gitignore.exists() {
+                builder.add(&global_gitignore);
+            }
+        }
+        // Always ignore .git directory
+        builder.add_line(None, ".git/")?;
+        builder.build()?
+    };
+
     progress::watching();
 
     // Bidirectional watch loop:
@@ -859,10 +881,20 @@ async fn watch_command(
 
             // Check for local file changes
             Some(events) = watch_rx.recv() => {
-                // Collect unique changed paths
+                // Collect unique changed paths, filtering out gitignored files
                 let paths: Vec<_> = events
                     .iter()
                     .flat_map(|e| e.paths.iter())
+                    .filter(|path| {
+                        // Get relative path for gitignore matching
+                        let rel_path = match path.strip_prefix(local) {
+                            Ok(p) => p,
+                            Err(_) => return false,
+                        };
+                        // Check if path is gitignored (is_dir hint based on path existence)
+                        let is_dir = path.is_dir();
+                        !gitignore.matched(rel_path, is_dir).is_ignore()
+                    })
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
@@ -871,7 +903,7 @@ async fn watch_command(
                     continue;
                 }
 
-                debug!("Local changes: {} paths", paths.len());
+                debug!("Local changes: {} paths (after gitignore filter)", paths.len());
 
                 // Incremental sync local -> remote
                 let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();

@@ -150,12 +150,25 @@ pub fn watching() {
     print_status(status::WATCHING, "for changes (Ctrl+C to stop)");
 }
 
-/// Show "Syncing path/to/file.rs (2.3 KiB)"
-pub fn syncing_file(path: &std::path::Path, size: u64) {
+/// Direction of file sync
+#[derive(Debug, Clone, Copy)]
+pub enum SyncDirection {
+    /// Local -> Remote (upload)
+    Upload,
+    /// Remote -> Local (download)
+    Download,
+}
+
+/// Show "Syncing path/to/file.rs (2.3 KiB) ->" or "<-"
+pub fn syncing_file(path: &std::path::Path, size: u64, direction: SyncDirection) {
     let size_str = humansize::format_size(size, humansize::BINARY);
+    let arrow = match direction {
+        SyncDirection::Upload => "->",
+        SyncDirection::Download => "<-",
+    };
     print_status(
         status::SYNCING,
-        &format!("{} ({})", path.display(), size_str),
+        &format!("{} ({}) {}", path.display(), size_str, arrow),
     );
 }
 
