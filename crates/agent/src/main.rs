@@ -3,14 +3,78 @@
 //! Binary deployed to remote hosts, communicates over stdin/stdout
 //! using a length-prefixed binary protocol.
 
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc;
+
+/// Tracks files written by the protocol to suppress self-triggered watch events.
+/// Uses content hashes for reliable detection - if the file on disk matches
+/// what we wrote, suppress the event.
+struct RecentWrites {
+    /// Map of absolute path -> hash we wrote
+    writes: Mutex<HashMap<PathBuf, ContentHash>>,
+}
+
+impl RecentWrites {
+    fn new() -> Self {
+        Self {
+            writes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record that a file was just written by the protocol with the given hash
+    fn record(&self, path: PathBuf, hash: ContentHash) {
+        let mut writes = self.writes.lock().unwrap();
+        writes.insert(path, hash);
+    }
+
+    /// Check if a path should be suppressed.
+    /// Returns true if the file's current hash matches what we wrote.
+    fn should_suppress(&self, path: &PathBuf) -> bool {
+        let writes = self.writes.lock().unwrap();
+        let Some(expected_hash) = writes.get(path) else {
+            return false;
+        };
+
+        // Hash the current file and compare
+        match ContentHash::from_file(path) {
+            Ok(current_hash) => current_hash == *expected_hash,
+            Err(_) => false, // File gone or unreadable, don't suppress
+        }
+    }
+
+    /// Clear the recorded hash for a path (called after we've processed/suppressed it)
+    fn clear(&self, path: &PathBuf) {
+        let mut writes = self.writes.lock().unwrap();
+        writes.remove(path);
+    }
+
+    /// Filter events, removing any for files that still match what we wrote
+    fn filter_events(&self, events: Vec<DebouncedEvent>) -> Vec<DebouncedEvent> {
+        events
+            .into_iter()
+            .filter(|e| {
+                // Check each path in the event
+                !e.paths.iter().any(|p| {
+                    if self.should_suppress(p) {
+                        // Hash matched, suppress and clear
+                        self.clear(p);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            })
+            .collect()
+    }
+}
 
 use zsync_core::{
     ChunkCache, ChunkStore, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter,
@@ -83,6 +147,11 @@ async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
     let cas = ChunkStore::open(&cas_path)?;
     eprintln!("CAS chunk store initialized at {}", cas_path.display());
 
+    // Track recently-written files to suppress self-triggered watch events
+    // Uses content hashes - if file matches what we wrote, suppress the event
+    let recent_writes = Arc::new(RecentWrites::new());
+    let recent_writes_for_watcher = Arc::clone(&recent_writes);
+
     // Set up file watcher
     let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<DebouncedEvent>>(100);
     let root_clone = root.clone();
@@ -104,6 +173,9 @@ async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
                     })
                     .collect();
 
+                // Filter out files recently written by the protocol (self-triggered events)
+                let filtered = recent_writes_for_watcher.filter_events(filtered);
+
                 if !filtered.is_empty() {
                     let _ = watch_tx.blocking_send(filtered);
                 }
@@ -124,7 +196,14 @@ async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
     let cache_for_io = cache;
     let cas_for_io = cas;
     std::thread::spawn(move || {
-        run_io_thread(root_for_io, msg_tx, write_rx, cache_for_io, cas_for_io);
+        run_io_thread(
+            root_for_io,
+            msg_tx,
+            write_rx,
+            cache_for_io,
+            cas_for_io,
+            recent_writes,
+        );
     });
 
     loop {
@@ -184,6 +263,7 @@ fn run_io_thread(
     write_rx: std::sync::mpsc::Receiver<WriteCommand>,
     cache: ChunkCache,
     cas: ChunkStore,
+    recent_writes: Arc<RecentWrites>,
 ) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -215,7 +295,15 @@ fn run_io_thread(
             WriteCommand::HandleMessage { msg } => {
                 let should_shutdown = matches!(msg, Message::Shutdown);
 
-                match handle_message(&root, msg, &mut writer, &mut batch_mode, &cache, &cas) {
+                match handle_message(
+                    &root,
+                    msg,
+                    &mut writer,
+                    &mut batch_mode,
+                    &cache,
+                    &cas,
+                    &recent_writes,
+                ) {
                     Ok(BatchResponse::Normal) => {}
                     Ok(BatchResponse::BatchStarted) => {
                         batch_errors.clear();
@@ -283,12 +371,23 @@ fn run_daemon(root: &PathBuf) -> Result<()> {
     let mut batch_index: u32 = 0;
     let mut batch_success: u32 = 0;
 
+    // Legacy mode doesn't watch files, but handle_message still needs RecentWrites
+    let recent_writes = RecentWrites::new();
+
     loop {
         match reader.read_message() {
             Ok(msg) => {
                 let should_shutdown = matches!(msg, Message::Shutdown);
 
-                match handle_message(root, msg, &mut writer, &mut batch_mode, &cache, &cas) {
+                match handle_message(
+                    root,
+                    msg,
+                    &mut writer,
+                    &mut batch_mode,
+                    &cache,
+                    &cas,
+                    &recent_writes,
+                ) {
                     Ok(BatchResponse::Normal) => {}
                     Ok(BatchResponse::BatchStarted) => {
                         batch_errors.clear();
@@ -348,6 +447,7 @@ fn handle_message<W: Write>(
     batch_mode: &mut bool,
     cache: &ChunkCache,
     cas: &ChunkStore,
+    recent_writes: &RecentWrites,
 ) -> Result<BatchResponse> {
     match msg {
         Message::SnapshotReq => {
@@ -359,7 +459,12 @@ fn handle_message<W: Write>(
 
         Message::WriteFile { path, data, mode } => {
             let full_path = root.join(&path);
+            let file_hash = ContentHash::from_bytes(&data);
             write_file(&full_path, &data, mode)?;
+
+            // Record the write so we can suppress self-triggered watch events
+            recent_writes.record(full_path, file_hash);
+
             if *batch_mode {
                 Ok(BatchResponse::BatchOp)
             } else {
@@ -452,8 +557,12 @@ fn handle_message<W: Write>(
             let delta = DeltaComputer::decompress_delta(&delta)?;
             let computer = DeltaComputer::new();
             let new_data = computer.apply(&old_data, &delta)?;
+            let file_hash = ContentHash::from_bytes(&new_data);
 
             write_file(&full_path, &new_data, mode)?;
+
+            // Record the write so we can suppress self-triggered watch events
+            recent_writes.record(full_path, file_hash);
 
             if *batch_mode {
                 Ok(BatchResponse::BatchOp)
@@ -509,6 +618,9 @@ fn handle_message<W: Write>(
             );
 
             write_file(&full_path, &data, mode)?;
+
+            // Record the write so we can suppress self-triggered watch events
+            recent_writes.record(full_path, manifest.file_hash);
 
             if *batch_mode {
                 Ok(BatchResponse::BatchOp)

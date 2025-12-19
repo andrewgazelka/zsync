@@ -17,7 +17,7 @@ use std::time::Duration;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, builder::Styles};
 use color_eyre::Result;
-use ignore::gitignore::GitignoreBuilder;
+use ignore::WalkBuilder;
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use tracing::{debug, error, info, warn};
@@ -28,6 +28,55 @@ use zsync_core::{
     ChunkConfig, ContentHash, FileManifest, Scanner, Snapshot, ZsyncConfig, chunk_data,
 };
 use zsync_transport::{AgentSession, SshTransport};
+
+/// Checks if paths are ignored by gitignore rules.
+/// Pre-builds an ignore matcher from the root directory for efficient repeated checks.
+struct IgnoreChecker {
+    /// Set of all non-ignored file paths (relative to root)
+    included_paths: std::collections::HashSet<PathBuf>,
+}
+
+impl IgnoreChecker {
+    /// Build an ignore checker by walking the directory once.
+    fn new(root: &Path) -> Self {
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .require_git(false)
+            .filter_entry(|e| e.file_name() != ".git");
+
+        let included_paths: std::collections::HashSet<PathBuf> = builder
+            .build()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                path.strip_prefix(root).ok().map(Path::to_path_buf)
+            })
+            .collect();
+
+        Self { included_paths }
+    }
+
+    /// Check if a relative path is ignored
+    fn is_ignored(&self, rel_path: &Path) -> bool {
+        // Check if the path or any of its ancestors is in our included set
+        // For a file like "target/debug/foo", we need to check if "target" would be walked
+        // If "target" isn't in our set, then "target/debug/foo" is ignored
+        let mut check_path = rel_path.to_path_buf();
+        loop {
+            if self.included_paths.contains(&check_path) {
+                return false; // This path or ancestor is included
+            }
+            if !check_path.pop() {
+                break;
+            }
+        }
+        true // Neither the path nor any ancestor is in the included set
+    }
+}
 
 /// Maximum bytes of chunk data per batch to avoid SSH flow control deadlock.
 ///
@@ -846,26 +895,8 @@ async fn watch_command(
 
     debouncer.watch(local, RecursiveMode::Recursive)?;
 
-    // Build gitignore matcher to filter watched files
-    // This prevents syncing target/, node_modules/, etc.
-    let gitignore = {
-        let mut builder = GitignoreBuilder::new(local);
-        // Add .gitignore if it exists
-        let gitignore_path = local.join(".gitignore");
-        if gitignore_path.exists() {
-            builder.add(&gitignore_path);
-        }
-        // Add global gitignore
-        if let Some(home) = dirs::home_dir() {
-            let global_gitignore = home.join(".config/git/ignore");
-            if global_gitignore.exists() {
-                builder.add(&global_gitignore);
-            }
-        }
-        // Always ignore .git directory
-        builder.add_line(None, ".git/")?;
-        builder.build()?
-    };
+    // Build ignore checker once - walks directory to find all non-ignored paths
+    let ignore_checker = IgnoreChecker::new(local);
 
     progress::watch_mode();
 
@@ -890,9 +921,8 @@ async fn watch_command(
                         let Ok(rel_path) = path.strip_prefix(local) else {
                             return false;
                         };
-                        // Check if path is gitignored (is_dir hint based on path existence)
-                        let is_dir = path.is_dir();
-                        !gitignore.matched(rel_path, is_dir).is_ignore()
+                        // Check against pre-built ignore set
+                        !ignore_checker.is_ignored(rel_path)
                     })
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()

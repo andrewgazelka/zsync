@@ -437,4 +437,67 @@ include = [".env", "secrets/key.pem"]
             "keep.txt should still be present: {paths:?}"
         );
     }
+
+    #[test]
+    fn test_scan_ignores_target_directory() {
+        let dir = TempDir::new().unwrap();
+        // Create .git to make ignore crate recognize this as a git repo
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        // Create .gitignore with target
+        fs::write(dir.path().join(".gitignore"), "target\n").unwrap();
+        // Create target directory with nested files (like cargo does)
+        fs::create_dir_all(dir.path().join("target/debug/build/foo")).unwrap();
+        fs::write(
+            dir.path().join("target/debug/build/foo/build-script"),
+            "binary",
+        )
+        .unwrap();
+        // Create a normal file
+        fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
+
+        let scanner = Scanner::new(dir.path());
+        let entries = scanner.scan().unwrap();
+        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
+
+        // src.rs and .gitignore should be present
+        assert!(
+            paths.contains(&PathBuf::from("src.rs")),
+            "src.rs should be present: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from(".gitignore")),
+            ".gitignore should be present: {paths:?}"
+        );
+        // target files should NOT be present
+        assert!(
+            !paths.iter().any(|p| p.starts_with("target")),
+            "target/ files should be ignored: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_gitignore_builder_matches_nested_paths() {
+        use ignore::gitignore::GitignoreBuilder;
+
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "target\n").unwrap();
+
+        let mut builder = GitignoreBuilder::new(dir.path());
+        builder.add(dir.path().join(".gitignore"));
+        let gitignore = builder.build().unwrap();
+
+        // Test direct match
+        let target_match = gitignore.matched(Path::new("target"), true);
+        assert!(target_match.is_ignore(), "target/ should be ignored");
+
+        // Test nested path match
+        let nested_match =
+            gitignore.matched(Path::new("target/debug/build/foo/build-script"), false);
+        assert!(
+            nested_match.is_ignore(),
+            "target/debug/build/foo/build-script should be ignored, got: {:?}",
+            nested_match
+        );
+    }
 }
