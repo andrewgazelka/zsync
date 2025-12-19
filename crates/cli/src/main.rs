@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| cli.local.clone());
 
     // Parse remote destination (includes port if specified)
-    let remote = parse_remote(&cli.remote, cli.port, &local)?;
+    let remote = parse_remote(&cli.remote, cli.port, &local);
 
     if cli.watch {
         watch_command(&cli.local, &remote, cli.debounce, &cli.include, cli.delete).await?;
@@ -1026,6 +1026,17 @@ struct RemoteSpec {
     path: String,
 }
 
+/// Load SSH config from ~/.ssh/config
+fn load_ssh_config() -> Option<ssh2_config::SshConfig> {
+    let home = dirs::home_dir()?;
+    let config_path = home.join(".ssh/config");
+    let file = std::fs::File::open(&config_path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    ssh2_config::SshConfig::default()
+        .parse(&mut reader, ssh2_config::ParseRule::ALLOW_UNKNOWN_FIELDS)
+        .ok()
+}
+
 /// Parse remote string into components.
 ///
 /// Formats:
@@ -1033,49 +1044,86 @@ struct RemoteSpec {
 /// - `user@host:2222` → port 2222, path from local dir
 /// - `user@host:/path` → port 22, explicit path
 /// - `user@host:2222:/path` → port 2222, explicit path
+/// - `host:/path` → SSH config host with path (user/port from ~/.ssh/config)
+/// - `host:path` → SSH config host with relative path
+/// - `host` → SSH config host, default path
 ///
 /// The `port_override` takes precedence over port in the remote string.
 /// The `local_dir` is used to generate default path when none specified.
-fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> Result<RemoteSpec> {
-    let at_pos = remote
-        .find('@')
-        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid remote format, expected user@host"))?;
+fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> RemoteSpec {
+    // Check if there's an @ symbol (explicit user@host format)
+    let (user, host, parsed_port, parsed_path) = if let Some(at_pos) = remote.find('@') {
+        // Explicit user@host format
+        let user = remote[..at_pos].to_string();
+        let rest = &remote[at_pos + 1..];
 
-    let user = remote[..at_pos].to_string();
-    let rest = &remote[at_pos + 1..];
+        // Find all colons
+        let colon_positions: Vec<usize> = rest.match_indices(':').map(|(i, _)| i).collect();
 
-    // Find all colons
-    let colon_positions: Vec<usize> = rest.match_indices(':').map(|(i, _)| i).collect();
-
-    let (host, parsed_port, parsed_path) = if colon_positions.is_empty() {
-        // Just user@host
-        (rest.to_string(), 22, None)
-    } else {
-        let first_colon = colon_positions[0];
-        let host = rest[..first_colon].to_string();
-        let after_first_colon = &rest[first_colon + 1..];
-
-        if colon_positions.len() >= 2 {
-            // Could be host:port:/path - check if first segment is numeric
-            let potential_port = &rest[first_colon + 1..colon_positions[1]];
-
-            if let Ok(port_num) = potential_port.parse::<u16>() {
-                // It's host:port:/path
-                let path = rest[colon_positions[1] + 1..].to_string();
-                (host, port_num, Some(path))
-            } else {
-                // Not a port number, treat as host:/path/with:colon
-                (host, 22, Some(after_first_colon.to_string()))
-            }
+        let (host, parsed_port, parsed_path) = if colon_positions.is_empty() {
+            // Just user@host
+            (rest.to_string(), 22, None)
         } else {
-            // One colon: could be host:port or host:/path
-            // If it parses as u16, it's a port; otherwise it's a path
-            if let Ok(port_num) = after_first_colon.parse::<u16>() {
-                (host, port_num, None)
+            let first_colon = colon_positions[0];
+            let host = rest[..first_colon].to_string();
+            let after_first_colon = &rest[first_colon + 1..];
+
+            if colon_positions.len() >= 2 {
+                // Could be host:port:/path - check if first segment is numeric
+                let potential_port = &rest[first_colon + 1..colon_positions[1]];
+
+                if let Ok(port_num) = potential_port.parse::<u16>() {
+                    // It's host:port:/path
+                    let path = rest[colon_positions[1] + 1..].to_string();
+                    (host, port_num, Some(path))
+                } else {
+                    // Not a port number, treat as host:/path/with:colon
+                    (host, 22, Some(after_first_colon.to_string()))
+                }
             } else {
-                (host, 22, Some(after_first_colon.to_string()))
+                // One colon: could be host:port or host:/path
+                // If it parses as u16, it's a port; otherwise it's a path
+                if let Ok(port_num) = after_first_colon.parse::<u16>() {
+                    (host, port_num, None)
+                } else {
+                    (host, 22, Some(after_first_colon.to_string()))
+                }
             }
-        }
+        };
+
+        (user, host, parsed_port, parsed_path)
+    } else {
+        // No @ symbol - treat as SSH config host
+        // Format: host, host:/path, or host:path
+        let colon_pos = remote.find(':');
+
+        let (host_alias, parsed_path) = if let Some(pos) = colon_pos {
+            let host = remote[..pos].to_string();
+            let path = remote[pos + 1..].to_string();
+            (host, Some(path))
+        } else {
+            (remote.to_string(), None)
+        };
+
+        // Look up host in SSH config
+        let ssh_config = load_ssh_config();
+        let params = ssh_config.as_ref().map(|cfg| cfg.query(&host_alias));
+
+        // Extract user from SSH config, or default to current user
+        let user = params
+            .as_ref()
+            .and_then(|p| p.user.clone())
+            .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".to_string()));
+
+        // Extract hostname (may differ from alias) and port from SSH config
+        let host = params
+            .as_ref()
+            .and_then(|p| p.host_name.clone())
+            .unwrap_or_else(|| host_alias.clone());
+
+        let parsed_port = params.as_ref().and_then(|p| p.port).unwrap_or(22);
+
+        (user, host, parsed_port, parsed_path)
     };
 
     // Port override from -p flag takes precedence
@@ -1089,12 +1137,12 @@ fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> R
         format!("~/zsync/{dir_name}")
     });
 
-    Ok(RemoteSpec {
+    RemoteSpec {
         user,
         host,
         port,
         path,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1107,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote() {
-        let remote = parse_remote("root@example.com:/home/user", None, &test_local()).unwrap();
+        let remote = parse_remote("root@example.com:/home/user", None, &test_local());
         assert_eq!(remote.user, "root");
         assert_eq!(remote.host, "example.com");
         assert_eq!(remote.port, 22);
@@ -1116,7 +1164,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_with_port() {
-        let remote = parse_remote("root@example.com:2222:/home/user", None, &test_local()).unwrap();
+        let remote = parse_remote("root@example.com:2222:/home/user", None, &test_local());
         assert_eq!(remote.user, "root");
         assert_eq!(remote.host, "example.com");
         assert_eq!(remote.port, 2222);
@@ -1125,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_relative_path() {
-        let remote = parse_remote("user@host:workspace/project", None, &test_local()).unwrap();
+        let remote = parse_remote("user@host:workspace/project", None, &test_local());
         assert_eq!(remote.user, "user");
         assert_eq!(remote.host, "host");
         assert_eq!(remote.port, 22);
@@ -1134,8 +1182,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_relative_path_with_port() {
-        let remote =
-            parse_remote("user@host:10249:workspace/project", None, &test_local()).unwrap();
+        let remote = parse_remote("user@host:10249:workspace/project", None, &test_local());
         assert_eq!(remote.user, "user");
         assert_eq!(remote.host, "host");
         assert_eq!(remote.port, 10249);
@@ -1144,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_no_path() {
-        let remote = parse_remote("root@example.com", None, &test_local()).unwrap();
+        let remote = parse_remote("root@example.com", None, &test_local());
         assert_eq!(remote.user, "root");
         assert_eq!(remote.host, "example.com");
         assert_eq!(remote.port, 22);
@@ -1153,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_port_only() {
-        let remote = parse_remote("root@example.com:2222", None, &test_local()).unwrap();
+        let remote = parse_remote("root@example.com:2222", None, &test_local());
         assert_eq!(remote.user, "root");
         assert_eq!(remote.host, "example.com");
         assert_eq!(remote.port, 2222);
@@ -1163,8 +1210,29 @@ mod tests {
     #[test]
     fn test_parse_remote_port_override() {
         // -p flag should override port in remote string
-        let remote = parse_remote("root@example.com:2222", Some(3333), &test_local()).unwrap();
+        let remote = parse_remote("root@example.com:2222", Some(3333), &test_local());
         assert_eq!(remote.port, 3333);
+        assert_eq!(remote.path, "~/zsync/myproject");
+    }
+
+    #[test]
+    fn test_parse_remote_ssh_config_host() {
+        // SSH config host without @ - should use current user as fallback
+        let remote = parse_remote("myserver:/workspace", None, &test_local());
+        // User comes from $USER env or defaults to "root"
+        assert!(!remote.user.is_empty());
+        // Host falls back to alias if not in SSH config
+        assert_eq!(remote.host, "myserver");
+        assert_eq!(remote.port, 22);
+        assert_eq!(remote.path, "/workspace");
+    }
+
+    #[test]
+    fn test_parse_remote_ssh_config_host_no_path() {
+        // SSH config host without path
+        let remote = parse_remote("myserver", None, &test_local());
+        assert!(!remote.user.is_empty());
+        assert_eq!(remote.host, "myserver");
         assert_eq!(remote.path, "~/zsync/myproject");
     }
 }
