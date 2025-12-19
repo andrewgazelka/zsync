@@ -61,6 +61,25 @@ fn multi() -> &'static indicatif::MultiProgress {
     MULTI.get_or_init(indicatif::MultiProgress::new)
 }
 
+/// Get terminal width, defaulting to 80 if unavailable
+fn terminal_width() -> usize {
+    console::Term::stderr().size().1 as usize
+}
+
+/// Truncate text to fit within max_width, adding "..." if truncated.
+/// Uses Unicode-aware width measurement.
+fn truncate_to_width(text: &str, max_width: usize) -> std::borrow::Cow<'_, str> {
+    let text_width = console::measure_text_width(text);
+    if text_width <= max_width {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    // Leave room for "..."
+    let target_width = max_width.saturating_sub(3);
+    let truncated = console::truncate_str(text, target_width, "...");
+    std::borrow::Cow::Owned(truncated.to_string())
+}
+
 /// Status verbs for cargo-style output (right-aligned to 12 chars)
 mod status {
     pub const CONNECTING: &str = "Connecting";
@@ -76,10 +95,22 @@ mod status {
     pub const WATCHING: &str = "Watching";
 }
 
-/// Print a cargo-style status line, coordinated with any active progress bars
+/// Width of status prefix: 12 chars for right-aligned status + 1 space separator
+const STATUS_PREFIX_WIDTH: usize = 13;
+
+/// Print a cargo-style status line, coordinated with any active progress bars.
+/// Truncates message to fit terminal width, preventing line wrapping that causes
+/// display corruption on terminal resize.
 fn print_status(status: &str, message: &str) {
     let style = console::Style::new().green().bold();
-    let line = format!("{:>12} {}", style.apply_to(status), message);
+
+    // Leave 1 char margin to avoid edge cases
+    let available = terminal_width()
+        .saturating_sub(STATUS_PREFIX_WIDTH)
+        .saturating_sub(1);
+    let truncated_message = truncate_to_width(message, available);
+
+    let line = format!("{:>12} {}", style.apply_to(status), truncated_message);
     multi().println(line).ok();
 }
 
