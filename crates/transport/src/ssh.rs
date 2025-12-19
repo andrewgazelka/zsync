@@ -51,6 +51,9 @@ pub struct AgentSession {
     channel: russh::Channel<russh::client::Msg>,
     root: PathBuf,
     buffer: Vec<u8>,
+    /// Track if we received a ChangeNotify during a request/response
+    /// that should be returned on the next try_read_message call.
+    pending_change_notify: bool,
 }
 
 impl AgentSession {
@@ -171,6 +174,25 @@ impl AgentSession {
         }
     }
 
+    /// Read a response message, buffering any ChangeNotify messages for later.
+    ///
+    /// In watch mode, the server can send ChangeNotify at any time. When we're
+    /// waiting for a specific response (like MissingChunks), we need to buffer
+    /// the ChangeNotify and return it later via try_read_message.
+    async fn read_response(&mut self) -> Result<Message> {
+        loop {
+            let msg = self.read_message().await?;
+            match msg {
+                Message::ChangeNotify => {
+                    tracing::debug!("buffering ChangeNotify received during request/response");
+                    self.pending_change_notify = true;
+                    // Continue reading until we get the actual response
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
     /// Try to read a message with a timeout.
     /// Returns None if no message is available within the timeout.
     /// This is used to poll for server-initiated messages like CHANGE_NOTIFY.
@@ -178,6 +200,12 @@ impl AgentSession {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<Option<Message>> {
+        // First check for pending ChangeNotify from a previous request/response
+        if self.pending_change_notify {
+            self.pending_change_notify = false;
+            return Ok(Some(Message::ChangeNotify));
+        }
+
         tokio::select! {
             biased;
 
@@ -215,7 +243,7 @@ impl AgentSession {
         self.send(&[protocol::msg::SNAPSHOT_REQ, 0, 0, 0, 0])
             .await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::SnapshotResp(snapshot) => Ok(snapshot),
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Snapshot failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
@@ -245,7 +273,7 @@ impl AgentSession {
 
         self.send(&msg).await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::Ok => Ok(()),
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Write failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
@@ -265,7 +293,7 @@ impl AgentSession {
 
         self.send(&msg).await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::Ok => Ok(()),
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Delete failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
@@ -348,7 +376,7 @@ impl AgentSession {
     pub async fn end_batch(&mut self) -> Result<BatchOperationResult> {
         self.send(&[protocol::msg::BATCH_END, 0, 0, 0, 0]).await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::BatchResult {
                 success_count,
                 errors,
@@ -376,7 +404,7 @@ impl AgentSession {
 
         self.send(&msg).await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::SignatureResp { signature, .. } => Ok(signature),
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Signature request failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
@@ -399,7 +427,7 @@ impl AgentSession {
 
         self.send(&msg).await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::Ok => Ok(()),
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Delta write failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
@@ -423,7 +451,7 @@ impl AgentSession {
 
         self.send(&msg).await?;
 
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::MissingChunks { hashes } => Ok(hashes),
             Message::Error(msg) => Err(color_eyre::eyre::eyre!("Check chunks failed: {msg}")),
             other => Err(color_eyre::eyre::eyre!("Unexpected response: {other:?}")),
@@ -495,7 +523,7 @@ impl AgentSession {
         }
 
         tracing::debug!("all chunks sent, waiting for server response");
-        match self.read_message().await? {
+        match self.read_response().await? {
             Message::Ok => {
                 tracing::debug!("store_chunks_with_progress: server acknowledged OK");
                 Ok(())
@@ -1151,6 +1179,7 @@ impl SshTransport {
             channel,
             root: PathBuf::from(root),
             buffer: Vec::new(),
+            pending_change_notify: false,
         })
     }
 
