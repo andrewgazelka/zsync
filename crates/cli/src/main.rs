@@ -68,7 +68,6 @@ struct ManifestBatchResult {
 async fn execute_manifest_batches(
     agent: &mut AgentSession,
     ops: &[ManifestOp<'_>],
-    pb: &indicatif::ProgressBar,
 ) -> Result<ManifestBatchResult> {
     let mut total_success = 0u32;
     let mut all_errors: Vec<(u32, String)> = Vec::new();
@@ -83,21 +82,14 @@ async fn execute_manifest_batches(
                     manifest,
                     mode,
                 } => {
-                    let file_name = path
-                        .file_name()
-                        .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
-                    pb.set_prefix(file_name.to_string());
+                    progress::syncing_file(path, manifest.size);
                     agent.queue_write_manifest(path, manifest, *mode).await?;
                 }
                 ManifestOp::Delete { path } => {
-                    let file_name = path
-                        .file_name()
-                        .map_or_else(|| path.to_string_lossy(), |n| n.to_string_lossy());
-                    pb.set_prefix(format!("(delete) {file_name}"));
+                    progress::deleting_file(path);
                     agent.queue_delete_file(path).await?;
                 }
             }
-            pb.inc(1);
         }
 
         let result = agent.end_batch().await?;
@@ -375,10 +367,6 @@ async fn transfer_files_cas(
         upload_bar.finish();
     }
 
-    // Send file manifests and deletes in batches to avoid SSH flow control deadlock
-    let total_ops = (transfers.len() + to_delete.len()) as u64;
-    let pb = progress::SyncProgress::file_sync_bar(total_ops);
-
     // Collect all operations to batch them
     let mut all_ops: Vec<ManifestOp<'_>> = Vec::with_capacity(transfers.len() + to_delete.len());
     for transfer in transfers {
@@ -392,8 +380,8 @@ async fn transfer_files_cas(
         all_ops.push(ManifestOp::Delete { path });
     }
 
-    let batch_result = execute_manifest_batches(agent, &all_ops, &pb).await?;
-    pb.finish_and_clear();
+    // Send file manifests and deletes in batches
+    let batch_result = execute_manifest_batches(agent, &all_ops).await?;
 
     progress.finish(batch_result.success_count, batch_result.errors.len());
 

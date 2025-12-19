@@ -68,6 +68,8 @@ mod status {
     pub const SCANNING: &str = "Scanning";
     pub const CHECKING: &str = "Checking";
     pub const UPLOADING: &str = "Uploading";
+    pub const SYNCING: &str = "Syncing";
+    pub const DELETING: &str = "Deleting";
     pub const SYNCED: &str = "Synced";
     pub const IN_SYNC: &str = "In sync";
     pub const SKIPPED: &str = "Skipped";
@@ -115,6 +117,20 @@ pub fn already_in_sync(count: usize) {
 /// Show "Watching for changes..."
 pub fn watching() {
     print_status(status::WATCHING, "for changes (Ctrl+C to stop)");
+}
+
+/// Show "Syncing path/to/file.rs (2.3 KiB)"
+pub fn syncing_file(path: &std::path::Path, size: u64) {
+    let size_str = humansize::format_size(size, humansize::BINARY);
+    print_status(
+        status::SYNCING,
+        &format!("{} ({})", path.display(), size_str),
+    );
+}
+
+/// Show "Deleting path/to/file.rs"
+pub fn deleting_file(path: &std::path::Path) {
+    print_status(status::DELETING, &format!("{}", path.display()));
 }
 
 /// Progress bar for chunk uploads with byte-level tracking
@@ -198,22 +214,6 @@ impl SyncProgress {
             status::SKIPPED,
             "all chunks already on server (deduplication win!)",
         );
-    }
-
-    /// Create a progress bar for file syncing
-    pub fn file_sync_bar(total_files: u64) -> indicatif::ProgressBar {
-        let pb = multi().add(indicatif::ProgressBar::new(total_files));
-        pb.set_style(
-            indicatif::ProgressStyle::default_bar()
-                .template(
-                    "{msg:>12} [{bar:25.cyan/dim}] {pos}/{len} {prefix:.dim} {spinner:.green}",
-                )
-                .expect("valid template")
-                .progress_chars("=> "),
-        );
-        pb.set_message("Syncing");
-        pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        pb
     }
 
     /// Show final summary
