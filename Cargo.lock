@@ -4503,5 +4503,6 @@ dependencies = [
  "testcontainers",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zsync-core",
 ]
