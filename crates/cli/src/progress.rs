@@ -1,35 +1,65 @@
-//! Cargo-style progress output for zsync
+//! Modern progress UI for zsync
 //!
-//! Displays progress in the familiar cargo format:
+//! Custom ANSI-based progress display with:
+//! - Braille dot spinner for indeterminate operations
+//! - Unicode block progress bar for uploads
+//! - Semantic colors and left-aligned icons
+//!
+//! Example output:
 //! ```text
-//!    Checking 14808 unique chunks across 952 files...
-//!   Uploading [=========>           ] 45% 30.2 MiB/67.4 MiB src/main.rs
-//!     Syncing [===========>             ] 500/952 src/main.rs
-//!      Synced 952 files in 3.2s
+//! ⠋ Connecting to host:22...
+//! ✓ Connected via SSH
+//! ⠋ Scanning 542 files...
+//! ✓ Scanned 542 files
+//! → [████████████░░░░░░░░] 45% 30.2/67.4 MiB main.rs
+//! ✓ Synced 952 files in 3.2s
 //! ```
-//!
-//! Uses `indicatif::MultiProgress` to coordinate all terminal output and prevent
-//! display corruption from concurrent stderr writes.
-//!
-//! ## Ghostty Terminal Progress Protocol
-//!
-//! When running in Ghostty terminal (detected via `TERM_PROGRAM=ghostty` or
-//! `GHOSTTY_RESOURCES_DIR` env var), zsync emits OSC 9;4 escape sequences to
-//! show progress in the terminal tab/title bar.
 
 use std::io::Write as _;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Global MultiProgress instance for coordinating all terminal output.
-/// All progress bars and status messages go through this to prevent display corruption.
-static MULTI: OnceLock<indicatif::MultiProgress> = OnceLock::new();
+/// ANSI escape sequences for terminal control
+mod ansi {
+    pub const HIDE_CURSOR: &str = "\x1b[?25l";
+    pub const SHOW_CURSOR: &str = "\x1b[?25h";
+    pub const CLEAR_LINE: &str = "\x1b[2K\r";
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const RED: &str = "\x1b[31m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const BLUE: &str = "\x1b[34m";
+    pub const MAGENTA: &str = "\x1b[35m";
+    pub const CYAN: &str = "\x1b[36m";
+}
+
+/// Unicode icons for status messages
+mod icon {
+    pub const SUCCESS: &str = "✓";
+    pub const ERROR: &str = "✗";
+    pub const ARROW: &str = "→";
+    pub const BULLET: &str = "●";
+    pub const CIRCLE: &str = "○";
+    pub const WARN: &str = "!";
+}
+
+/// Spinner animation frames (braille dots)
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Progress bar characters
+mod bar {
+    pub const FILLED: char = '█';
+    pub const EMPTY: char = '░';
+    pub const WIDTH: usize = 20;
+}
 
 /// Whether we're running in Ghostty terminal (supports OSC 9;4 progress protocol)
 static IS_GHOSTTY: AtomicBool = AtomicBool::new(false);
 
-/// Initialize Ghostty detection. Call once at startup.
+/// Initialize progress UI. Call once at startup.
 pub fn init() {
     let is_ghostty = std::env::var("TERM_PROGRAM")
         .map(|v| v.eq_ignore_ascii_case("ghostty"))
@@ -42,7 +72,6 @@ pub fn init() {
 /// Set Ghostty tab progress (0-100). Only emits if running in Ghostty.
 fn set_ghostty_progress(percent: u8) {
     if IS_GHOSTTY.load(Ordering::Relaxed) {
-        // OSC 9;4;1;{percent} ST - Set progress bar (1 = normal progress)
         let _ = write!(std::io::stderr(), "\x1b]9;4;1;{percent}\x1b\\");
         let _ = std::io::stderr().flush();
     }
@@ -51,14 +80,9 @@ fn set_ghostty_progress(percent: u8) {
 /// Clear Ghostty tab progress. Only emits if running in Ghostty.
 fn clear_ghostty_progress() {
     if IS_GHOSTTY.load(Ordering::Relaxed) {
-        // OSC 9;4;0;0 ST - Clear progress bar (0 = remove)
         let _ = write!(std::io::stderr(), "\x1b]9;4;0;0\x1b\\");
         let _ = std::io::stderr().flush();
     }
-}
-
-fn multi() -> &'static indicatif::MultiProgress {
-    MULTI.get_or_init(indicatif::MultiProgress::new)
 }
 
 /// Get terminal width, defaulting to 80 if unavailable
@@ -66,89 +90,360 @@ fn terminal_width() -> usize {
     console::Term::stderr().size().1 as usize
 }
 
-/// Truncate text to fit within max_width, adding "..." if truncated.
-/// Uses Unicode-aware width measurement.
+/// Truncate text to fit within max_width, adding "..." if truncated
 fn truncate_to_width(text: &str, max_width: usize) -> std::borrow::Cow<'_, str> {
     let text_width = console::measure_text_width(text);
     if text_width <= max_width {
         return std::borrow::Cow::Borrowed(text);
     }
-
-    // Leave room for "..."
     let target_width = max_width.saturating_sub(3);
     let truncated = console::truncate_str(text, target_width, "...");
     std::borrow::Cow::Owned(truncated.to_string())
 }
 
-/// Status verbs for cargo-style output (right-aligned to 12 chars)
-mod status {
-    pub const CONNECTING: &str = "Connecting";
-    pub const CONNECTED: &str = "Connected";
-    pub const SCANNING: &str = "Scanning";
-    pub const CHECKING: &str = "Checking";
-    pub const UPLOADING: &str = "Uploading";
-    pub const SYNCING: &str = "Syncing";
-    pub const DELETING: &str = "Deleting";
-    pub const SYNCED: &str = "Synced";
-    pub const IN_SYNC: &str = "In sync";
-    pub const SKIPPED: &str = "Skipped";
-    pub const WATCHING: &str = "Watching";
+// ============================================================================
+// Status message functions (one-shot, newline-terminated)
+// ============================================================================
+
+/// Print success message: ✓ {msg} (green)
+pub fn success(msg: &str) {
+    let available = terminal_width().saturating_sub(3);
+    let msg = truncate_to_width(msg, available);
+    eprintln!(
+        "{}{}{} {}{}",
+        ansi::GREEN,
+        ansi::BOLD,
+        icon::SUCCESS,
+        msg,
+        ansi::RESET
+    );
 }
 
-/// Width of status prefix: 12 chars for right-aligned status + 1 space separator
-const STATUS_PREFIX_WIDTH: usize = 13;
-
-/// Print a cargo-style status line, coordinated with any active progress bars.
-/// Truncates message to fit terminal width, preventing line wrapping that causes
-/// display corruption on terminal resize.
-fn print_status(status: &str, message: &str) {
-    let style = console::Style::new().green().bold();
-
-    // Leave 1 char margin to avoid edge cases
-    let available = terminal_width()
-        .saturating_sub(STATUS_PREFIX_WIDTH)
-        .saturating_sub(1);
-    let truncated_message = truncate_to_width(message, available);
-
-    let line = format!("{:>12} {}", style.apply_to(status), truncated_message);
-    multi().println(line).ok();
+/// Print info message: → {msg} (cyan)
+pub fn info(msg: &str) {
+    let available = terminal_width().saturating_sub(3);
+    let msg = truncate_to_width(msg, available);
+    eprintln!("{}{} {}{}", ansi::CYAN, icon::ARROW, msg, ansi::RESET);
 }
 
-// ========== Connection Status ==========
-
-/// Show "Connecting to host:port..."
-pub fn connecting(host: &str, port: u16) {
-    print_status(status::CONNECTING, &format!("{host}:{port}..."));
+/// Print warning message: ! {msg} (yellow)
+pub fn warn(msg: &str) {
+    let available = terminal_width().saturating_sub(3);
+    let msg = truncate_to_width(msg, available);
+    eprintln!(
+        "{}{}{} {}{}",
+        ansi::YELLOW,
+        ansi::BOLD,
+        icon::WARN,
+        msg,
+        ansi::RESET
+    );
 }
 
-/// Show "Connected via SSH agent" or similar auth method
-pub fn connected(auth_method: &str) {
-    print_status(status::CONNECTED, &format!("via {auth_method}"));
+/// Print error message: ✗ {msg} (red)
+pub fn error(msg: &str) {
+    let available = terminal_width().saturating_sub(3);
+    let msg = truncate_to_width(msg, available);
+    eprintln!(
+        "{}{}{} {}{}",
+        ansi::RED,
+        ansi::BOLD,
+        icon::ERROR,
+        msg,
+        ansi::RESET
+    );
 }
 
-// ========== Scan Status ==========
-
-/// Show "Scanning N local files..."
-pub fn scanning_local(count: usize) {
-    print_status(status::SCANNING, &format!("{count} local files..."));
+/// Print dim/skipped message: ○ {msg} (dim)
+pub fn dim(msg: &str) {
+    let available = terminal_width().saturating_sub(3);
+    let msg = truncate_to_width(msg, available);
+    eprintln!("{}{} {}{}", ansi::DIM, icon::CIRCLE, msg, ansi::RESET);
 }
 
-/// Show "Checking N remote files..."
-pub fn checking_remote(count: usize) {
-    print_status(status::CHECKING, &format!("{count} remote files..."));
+/// Print indented info message:   → {msg} (blue, for file lists)
+pub fn file_sync(msg: &str) {
+    let available = terminal_width().saturating_sub(5);
+    let msg = truncate_to_width(msg, available);
+    eprintln!("{}  {} {}{}", ansi::BLUE, icon::ARROW, msg, ansi::RESET);
 }
 
-/// Show "In sync N files" when already synchronized
-pub fn already_in_sync(count: usize) {
-    print_status(status::IN_SYNC, &format!("{count} files"));
+/// Print indented delete message:   ✗ {msg} (red, for deletions)
+pub fn file_delete(msg: &str) {
+    let available = terminal_width().saturating_sub(5);
+    let msg = truncate_to_width(msg, available);
+    eprintln!("{}  {} {}{}", ansi::RED, icon::ERROR, msg, ansi::RESET);
 }
 
-// ========== Watch Mode ==========
-
-/// Show "Watching for changes..."
-pub fn watching() {
-    print_status(status::WATCHING, "for changes (Ctrl+C to stop)");
+/// Print watching message: ● {msg} (magenta)
+pub fn watching(msg: &str) {
+    let available = terminal_width().saturating_sub(3);
+    let msg = truncate_to_width(msg, available);
+    eprintln!(
+        "{}{}{} {}{}",
+        ansi::MAGENTA,
+        ansi::BOLD,
+        icon::BULLET,
+        msg,
+        ansi::RESET
+    );
 }
+
+// ============================================================================
+// Spinner - for indeterminate operations
+// ============================================================================
+
+/// Animated spinner for indeterminate operations.
+///
+/// The spinner runs in a background thread and updates every 80ms.
+/// Call `finish_success()` or `finish_error()` to stop and show final status.
+pub struct Spinner {
+    /// Shared state for the spinner thread
+    running: Arc<AtomicBool>,
+    /// Current message (can be updated)
+    message: Arc<std::sync::Mutex<String>>,
+    /// Handle to the spinner thread
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    /// Create and start a new spinner with the given message.
+    pub fn new(message: &str) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let message = Arc::new(std::sync::Mutex::new(message.to_string()));
+
+        let running_clone = Arc::clone(&running);
+        let message_clone = Arc::clone(&message);
+
+        // Hide cursor
+        eprint!("{}", ansi::HIDE_CURSOR);
+        let _ = std::io::stderr().flush();
+
+        let handle = std::thread::spawn(move || {
+            let mut frame = 0usize;
+            while running_clone.load(Ordering::Relaxed) {
+                let msg = message_clone.lock().unwrap().clone();
+                let spinner_char = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+
+                // Clear line and print spinner
+                eprint!(
+                    "{}{}{} {}{}",
+                    ansi::CLEAR_LINE,
+                    ansi::CYAN,
+                    spinner_char,
+                    msg,
+                    ansi::RESET
+                );
+                let _ = std::io::stderr().flush();
+
+                frame += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+
+        Self {
+            running,
+            message,
+            handle: Some(handle),
+        }
+    }
+
+    /// Update the spinner message without stopping it.
+    pub fn set_message(&self, message: &str) {
+        if let Ok(mut msg) = self.message.lock() {
+            *msg = message.to_string();
+        }
+    }
+
+    /// Stop the spinner and print a success message.
+    pub fn finish_success(self, message: &str) {
+        self.stop();
+        // Clear line and print success
+        eprint!("{}", ansi::CLEAR_LINE);
+        success(message);
+    }
+
+    /// Stop the spinner and print an error message.
+    pub fn finish_error(self, message: &str) {
+        self.stop();
+        // Clear line and print error
+        eprint!("{}", ansi::CLEAR_LINE);
+        error(message);
+    }
+
+    /// Stop the spinner without printing anything.
+    pub fn finish_silent(self) {
+        self.stop();
+        eprint!("{}", ansi::CLEAR_LINE);
+        let _ = std::io::stderr().flush();
+    }
+
+    fn stop(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        // Show cursor
+        eprint!("{}", ansi::SHOW_CURSOR);
+        let _ = std::io::stderr().flush();
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        // Ensure we stop if dropped without calling finish
+        if self.running.load(Ordering::Relaxed) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            eprint!("{}{}", ansi::CLEAR_LINE, ansi::SHOW_CURSOR);
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+// ============================================================================
+// ProgressBar - for uploads with byte tracking
+// ============================================================================
+
+/// Progress bar for determinate operations like uploads.
+///
+/// Updates in-place on a single line with byte progress and percentage.
+pub struct ProgressBar {
+    total: u64,
+    current: Arc<AtomicU64>,
+    message: Arc<std::sync::Mutex<String>>,
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressBar {
+    /// Create a new progress bar with the given total bytes.
+    pub fn new(total: u64) -> Self {
+        let current = Arc::new(AtomicU64::new(0));
+        let message = Arc::new(std::sync::Mutex::new(String::new()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let current_clone = Arc::clone(&current);
+        let message_clone = Arc::clone(&message);
+        let running_clone = Arc::clone(&running);
+
+        // Hide cursor and set initial Ghostty progress
+        eprint!("{}", ansi::HIDE_CURSOR);
+        let _ = std::io::stderr().flush();
+        set_ghostty_progress(0);
+
+        let handle = std::thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                let cur = current_clone.load(Ordering::Relaxed);
+                let msg = message_clone.lock().unwrap().clone();
+
+                Self::render(cur, total, &msg);
+
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+
+        Self {
+            total,
+            current,
+            message,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// Set the current file being processed (shown at end of bar).
+    pub fn set_message(&self, message: &str) {
+        if let Ok(mut msg) = self.message.lock() {
+            *msg = message.to_string();
+        }
+    }
+
+    /// Add bytes to the progress.
+    pub fn add(&self, bytes: u64) {
+        let new_value = self.current.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let percent = (new_value * 100 / self.total.max(1)) as u8;
+        set_ghostty_progress(percent.min(100));
+    }
+
+    /// Finish the progress bar successfully.
+    pub fn finish(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        // Clear line and show cursor
+        eprint!("{}{}", ansi::CLEAR_LINE, ansi::SHOW_CURSOR);
+        let _ = std::io::stderr().flush();
+        clear_ghostty_progress();
+    }
+
+    fn render(current: u64, total: u64, message: &str) {
+        let percent = if total > 0 {
+            (current * 100 / total) as usize
+        } else {
+            0
+        };
+        let filled = (percent * bar::WIDTH) / 100;
+        let empty = bar::WIDTH - filled;
+
+        let bar_str: String = std::iter::repeat_n(bar::FILLED, filled)
+            .chain(std::iter::repeat_n(bar::EMPTY, empty))
+            .collect();
+
+        let current_str = humansize::format_size(current, humansize::BINARY);
+        let total_str = humansize::format_size(total, humansize::BINARY);
+
+        // Calculate available space for message
+        // Format: "→ [████░░░░] 100% 999.9 MiB/999.9 MiB "
+        // That's about 45-50 chars, leave room for message
+        let term_width = terminal_width();
+        let prefix_len = 50; // approximate
+        let available = term_width.saturating_sub(prefix_len);
+        let msg_display = if message.is_empty() {
+            String::new()
+        } else {
+            truncate_to_width(message, available).to_string()
+        };
+
+        eprint!(
+            "{}{}{} [{}{}{}{}{}] {:>3}% {}/{} {}{}{}",
+            ansi::CLEAR_LINE,
+            ansi::CYAN,
+            icon::ARROW,
+            ansi::CYAN,
+            bar_str.chars().take(filled).collect::<String>(),
+            ansi::DIM,
+            bar_str.chars().skip(filled).collect::<String>(),
+            ansi::RESET,
+            percent,
+            current_str,
+            total_str,
+            ansi::DIM,
+            msg_display,
+            ansi::RESET
+        );
+        let _ = std::io::stderr().flush();
+    }
+}
+
+impl Drop for ProgressBar {
+    fn drop(&mut self) {
+        if self.running.load(Ordering::Relaxed) {
+            self.stop();
+        }
+    }
+}
+
+// ============================================================================
+// SyncProgress - high-level sync progress tracking
+// ============================================================================
 
 /// Direction of file sync
 #[derive(Debug, Clone, Copy)]
@@ -159,53 +454,7 @@ pub enum SyncDirection {
     Download,
 }
 
-/// Show "Syncing path/to/file.rs (2.3 KiB) ->" or "<-"
-pub fn syncing_file(path: &std::path::Path, size: u64, direction: SyncDirection) {
-    let size_str = humansize::format_size(size, humansize::BINARY);
-    let arrow = match direction {
-        SyncDirection::Upload => "->",
-        SyncDirection::Download => "<-",
-    };
-    print_status(
-        status::SYNCING,
-        &format!("{} ({}) {}", path.display(), size_str, arrow),
-    );
-}
-
-/// Show "Deleting path/to/file.rs"
-pub fn deleting_file(path: &std::path::Path) {
-    print_status(status::DELETING, &format!("{}", path.display()));
-}
-
-/// Progress bar for chunk uploads with byte-level tracking
-pub struct UploadProgress {
-    bar: indicatif::ProgressBar,
-    total_bytes: u64,
-}
-
-impl UploadProgress {
-    /// Set which file is currently being uploaded (shown as dim suffix)
-    pub fn set_current_file(&self, file_name: &str) {
-        self.bar.set_prefix(file_name.to_string());
-    }
-
-    /// Add bytes to the progress (call as chunks are uploaded)
-    pub fn add_bytes(&self, bytes: u64) {
-        self.bar.inc(bytes);
-
-        // Update Ghostty progress
-        let percent = (self.bar.position() * 100 / self.total_bytes.max(1)) as u8;
-        set_ghostty_progress(percent.min(100));
-    }
-
-    /// Mark upload as complete
-    pub fn finish(self) {
-        self.bar.finish_and_clear();
-        clear_ghostty_progress();
-    }
-}
-
-/// Progress tracker for the sync operation
+/// High-level sync progress tracker.
 pub struct SyncProgress {
     start: Instant,
 }
@@ -217,50 +466,7 @@ impl SyncProgress {
         }
     }
 
-    /// Show the initial "Checking X chunks across Y files" message
-    pub fn checking(chunks: usize, files: usize) {
-        print_status(
-            status::CHECKING,
-            &format!("{chunks} unique chunks across {files} files..."),
-        );
-    }
-
-    /// Create a progress bar for chunk uploads with byte tracking
-    ///
-    /// Returns an `UploadProgress` which tracks bytes uploaded and can display
-    /// which file's chunks are currently being processed.
-    pub fn upload_bar(total_bytes: u64) -> UploadProgress {
-        let pb = multi().add(indicatif::ProgressBar::new(total_bytes));
-        pb.set_style(
-            indicatif::ProgressStyle::default_bar()
-                // Format: "   Uploading [====>       ] 45% 30.2/67.4 MiB src/main.rs"
-                .template(
-                    "{msg:>12} [{bar:20.cyan/dim}] {percent:>3}% {binary_bytes}/{binary_total_bytes} {prefix:.dim}",
-                )
-                .expect("valid template")
-                .progress_chars("=> "),
-        );
-        pb.set_message(status::UPLOADING);
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        // Set initial Ghostty progress
-        set_ghostty_progress(0);
-
-        UploadProgress {
-            bar: pb,
-            total_bytes,
-        }
-    }
-
-    /// Show "All chunks already on server" message
-    pub fn chunks_deduped() {
-        print_status(
-            status::SKIPPED,
-            "all chunks already on server (deduplication win!)",
-        );
-    }
-
-    /// Show final summary
+    /// Show final summary.
     pub fn finish(&self, success_count: u32, error_count: usize) {
         let elapsed = self.start.elapsed();
         let elapsed_str = if elapsed.as_secs() >= 1 {
@@ -270,20 +476,11 @@ impl SyncProgress {
         };
 
         if error_count == 0 {
-            print_status(
-                status::SYNCED,
-                &format!("{success_count} files in {elapsed_str}"),
-            );
+            success(&format!("Synced {success_count} files in {elapsed_str}"));
         } else {
-            let style = console::Style::new().yellow().bold();
-            let line = format!(
-                "{:>12} {} successful, {} failed in {}",
-                style.apply_to("Finished"),
-                success_count,
-                error_count,
-                elapsed_str
-            );
-            multi().println(line).ok();
+            warn(&format!(
+                "{success_count} synced, {error_count} failed in {elapsed_str}"
+            ));
         }
     }
 }
@@ -292,4 +489,68 @@ impl Default for SyncProgress {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ============================================================================
+// Convenience functions for common messages
+// ============================================================================
+
+/// Show "Scanned N local files"
+pub fn scanning_local(count: usize) {
+    info(&format!("Scanned {count} local files"));
+}
+
+/// Show "Checked N remote files"
+pub fn checking_remote(count: usize) {
+    info(&format!("Checked {count} remote files"));
+}
+
+/// Show "Already in sync (N files)"
+pub fn already_in_sync(count: usize) {
+    success(&format!("Already in sync ({count} files)"));
+}
+
+/// Show "Checking N chunks across M files"
+pub fn checking_chunks(chunks: usize, files: usize) {
+    info(&format!("Checking {chunks} chunks across {files} files"));
+}
+
+/// Show "All chunks deduplicated"
+pub fn chunks_deduped() {
+    dim("All chunks already on server");
+}
+
+/// Create upload progress bar
+pub fn upload_bar(total_bytes: u64) -> ProgressBar {
+    ProgressBar::new(total_bytes)
+}
+
+/// Show "Syncing path (size) →" or "←"
+pub fn syncing_file(path: &std::path::Path, size: u64, direction: SyncDirection) {
+    let size_str = humansize::format_size(size, humansize::BINARY);
+    let arrow = match direction {
+        SyncDirection::Upload => "→",
+        SyncDirection::Download => "←",
+    };
+    file_sync(&format!("{} ({}) {}", path.display(), size_str, arrow));
+}
+
+/// Show "Deleting path"
+pub fn deleting_file(path: &std::path::Path) {
+    file_delete(&format!("{}", path.display()));
+}
+
+/// Show "Watching for changes..."
+pub fn watch_mode() {
+    watching("Watching for changes (Ctrl+C to stop)");
+}
+
+/// Show "Connecting to host:port..."
+pub fn connecting(host: &str, port: u16) -> Spinner {
+    Spinner::new(&format!("Connecting to {host}:{port}..."))
+}
+
+/// Finish connection spinner with success
+pub fn connected(spinner: Spinner, auth_method: &str) {
+    spinner.finish_success(&format!("Connected via {auth_method}"));
 }

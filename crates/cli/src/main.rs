@@ -283,7 +283,7 @@ async fn transfer_files_cas(
     }
 
     let all_hashes: Vec<ContentHash> = all_chunks.keys().copied().collect();
-    progress::SyncProgress::checking(all_hashes.len(), transfers.len());
+    progress::checking_chunks(all_hashes.len(), transfers.len());
 
     // Ask server which chunks are missing
     let missing_hashes = agent.check_chunks(&all_hashes).await?;
@@ -298,13 +298,13 @@ async fn transfer_files_cas(
     let total_chunk_bytes: u64 = chunks_to_send.iter().map(|(_, d)| d.len() as u64).sum();
 
     if chunks_to_send.is_empty() {
-        progress::SyncProgress::chunks_deduped();
+        progress::chunks_deduped();
     } else {
         // Calculate total bytes including protocol overhead (36 bytes header per chunk)
         let total_wire_bytes = total_chunk_bytes + (chunks_to_send.len() as u64 * 36);
 
         // Show progress bar for chunk upload with streaming progress
-        let upload_bar = progress::SyncProgress::upload_bar(total_wire_bytes);
+        let upload_bar = progress::upload_bar(total_wire_bytes);
 
         // Show summary of files being uploaded
         let file_summary = if transfers.len() == 1 {
@@ -319,7 +319,7 @@ async fn transfer_files_cas(
         } else {
             format!("{} files", transfers.len())
         };
-        upload_bar.set_current_file(&file_summary);
+        upload_bar.set_message(&file_summary);
 
         // Split chunks into batches to avoid SSH flow control deadlock.
         // Each batch is sent as a separate STORE_CHUNKS message, and we wait
@@ -339,7 +339,7 @@ async fn transfer_files_cas(
                 );
                 agent
                     .store_chunks_with_progress(&batch, |bytes| {
-                        upload_bar.add_bytes(bytes);
+                        upload_bar.add(bytes);
                     })
                     .await?;
                 batch.clear();
@@ -359,7 +359,7 @@ async fn transfer_files_cas(
             );
             agent
                 .store_chunks_with_progress(&batch, |bytes| {
-                    upload_bar.add_bytes(bytes);
+                    upload_bar.add(bytes);
                 })
                 .await?;
         }
@@ -604,9 +604,9 @@ async fn connect_and_start_agent(
     user: &str,
     remote_path: &str,
 ) -> Result<(SshTransport, AgentSession)> {
-    progress::connecting(host, port);
+    let spinner = progress::connecting(host, port);
     let mut transport = SshTransport::connect(host, port, user).await?;
-    progress::connected("SSH");
+    progress::connected(spinner, "SSH");
 
     let bundle = embedded_agents::embedded_bundle();
     if bundle.platforms().is_empty() {
@@ -867,7 +867,7 @@ async fn watch_command(
         builder.build()?
     };
 
-    progress::watching();
+    progress::watch_mode();
 
     // Bidirectional watch loop:
     // - Handle local file changes (sync local -> remote)
@@ -887,9 +887,8 @@ async fn watch_command(
                     .flat_map(|e| e.paths.iter())
                     .filter(|path| {
                         // Get relative path for gitignore matching
-                        let rel_path = match path.strip_prefix(local) {
-                            Ok(p) => p,
-                            Err(_) => return false,
+                        let Ok(rel_path) = path.strip_prefix(local) else {
+                            return false;
                         };
                         // Check if path is gitignored (is_dir hint based on path existence)
                         let is_dir = path.is_dir();
@@ -970,9 +969,9 @@ async fn connect_and_start_agent_watch(
     user: &str,
     remote_path: &str,
 ) -> Result<(SshTransport, AgentSession)> {
-    progress::connecting(host, port);
+    let spinner = progress::connecting(host, port);
     let mut transport = SshTransport::connect(host, port, user).await?;
-    progress::connected("SSH");
+    progress::connected(spinner, "SSH");
 
     let bundle = embedded_agents::embedded_bundle();
     if bundle.platforms().is_empty() {

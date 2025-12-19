@@ -61,7 +61,6 @@ clap = { version = "4", features = ["derive"] }
 
 # Human-readable output
 humansize = "2"
-indicatif = "0.17"
 console = "0.15"
 
 # Async utilities
