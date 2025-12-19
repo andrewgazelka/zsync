@@ -22,6 +22,7 @@
 //! - 0x31: MissingChunks (count:4, hashes:[32]*count)
 //! - 0x32: StoreChunks (count:4, (hash:32, len:4, data)*count)
 //! - 0x33: WriteManifest (path_len:2, path, executable:1, file_hash:32, size:8, chunk_count:4, hashes:[32]*count)
+//! - 0x40: ChangeNotify (count:4, (path_len:2, path, content_hash:32, change_type:1)*count)
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,37 @@ pub struct FileManifest {
     pub size: u64,
     /// Ordered list of chunk hashes
     pub chunks: Vec<ContentHash>,
+}
+
+/// Type of file change for ChangeNotify messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChangeType {
+    Modified = 0,
+    Created = 1,
+    Deleted = 2,
+}
+
+impl ChangeType {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Modified),
+            1 => Some(Self::Created),
+            2 => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+/// A single file change reported in ChangeNotify
+#[derive(Debug, Clone)]
+pub struct FileChange {
+    /// Relative path of the changed file
+    pub path: PathBuf,
+    /// Content hash of the file (zeroed for deletions)
+    pub content_hash: ContentHash,
+    /// Type of change
+    pub change_type: ChangeType,
 }
 
 /// Message type identifiers
@@ -399,8 +431,34 @@ impl<W: Write> ProtocolWriter<W> {
     }
 
     /// Send change notify - server tells client files have changed
-    pub fn send_change_notify(&mut self) -> Result<()> {
-        write_header(&mut self.inner, msg::CHANGE_NOTIFY, 0)?;
+    ///
+    /// Wire format:
+    /// ```text
+    /// count: u32 (number of changes)
+    /// for each change:
+    ///   path_len: u16
+    ///   path: [u8; path_len]
+    ///   content_hash: [u8; 32]
+    ///   change_type: u8
+    /// ```
+    pub fn send_change_notify(&mut self, changes: &[FileChange]) -> Result<()> {
+        // Calculate payload size
+        let payload_len: usize = 4 + changes
+            .iter()
+            .map(|c| 2 + c.path.to_string_lossy().len() + 32 + 1)
+            .sum::<usize>();
+
+        write_header(&mut self.inner, msg::CHANGE_NOTIFY, payload_len as u32)?;
+        self.inner
+            .write_all(&(changes.len() as u32).to_be_bytes())?;
+
+        for change in changes {
+            let path_encoded = encode_path(&change.path);
+            self.inner.write_all(&path_encoded)?;
+            self.inner.write_all(change.content_hash.as_bytes())?;
+            self.inner.write_all(&[change.change_type as u8])?;
+        }
+
         self.inner.flush()?;
         Ok(())
     }
@@ -474,8 +532,11 @@ pub enum Message {
         mode: u32,
     },
     // Bidirectional sync messages
-    /// Server notifies client that files have changed (no payload)
-    ChangeNotify,
+    /// Server notifies client that files have changed
+    ChangeNotify {
+        /// List of changed files with their hashes
+        changes: Vec<FileChange>,
+    },
 }
 
 /// Protocol reader for receiving messages
@@ -702,7 +763,34 @@ impl<R: Read> ProtocolReader<R> {
                 })
             }
 
-            msg::CHANGE_NOTIFY => Ok(Message::ChangeNotify),
+            msg::CHANGE_NOTIFY => {
+                let mut count_buf = [0u8; 4];
+                self.inner.read_exact(&mut count_buf)?;
+                let count = u32::from_be_bytes(count_buf) as usize;
+
+                let mut changes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let path = decode_path(&mut self.inner)?;
+
+                    let mut hash_buf = [0u8; 32];
+                    self.inner.read_exact(&mut hash_buf)?;
+                    let content_hash = ContentHash::from_raw(hash_buf);
+
+                    let mut type_buf = [0u8; 1];
+                    self.inner.read_exact(&mut type_buf)?;
+                    let change_type = ChangeType::from_u8(type_buf[0]).ok_or_else(|| {
+                        color_eyre::eyre::eyre!("invalid change type: {}", type_buf[0])
+                    })?;
+
+                    changes.push(FileChange {
+                        path,
+                        content_hash,
+                        change_type,
+                    });
+                }
+
+                Ok(Message::ChangeNotify { changes })
+            }
 
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }

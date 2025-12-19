@@ -78,6 +78,38 @@ impl IgnoreChecker {
     }
 }
 
+/// Tracks files recently uploaded to remote to filter self-triggered ChangeNotify.
+///
+/// When we upload files, the remote agent detects the changes and sends ChangeNotify.
+/// We use this tracker to filter out those notifications since we already know about them.
+struct RecentUploads {
+    /// Map of relative path -> content hash we uploaded
+    uploads: std::collections::HashMap<PathBuf, ContentHash>,
+}
+
+impl RecentUploads {
+    fn new() -> Self {
+        Self {
+            uploads: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record that we just uploaded a file with the given hash
+    fn record(&mut self, path: PathBuf, hash: ContentHash) {
+        self.uploads.insert(path, hash);
+    }
+
+    /// Check if a path+hash was uploaded by us (and should be filtered)
+    fn was_uploaded(&self, path: &Path, hash: &ContentHash) -> bool {
+        self.uploads.get(path).is_some_and(|h| h == hash)
+    }
+
+    /// Clear all tracked uploads (call after processing ChangeNotify)
+    fn clear(&mut self) {
+        self.uploads.clear();
+    }
+}
+
 /// Maximum bytes of chunk data per batch to avoid SSH flow control deadlock.
 ///
 /// When uploading chunks, we send them in batches of approximately this size.
@@ -571,6 +603,7 @@ async fn sync_changed_paths(
     local: &Path,
     agent: &mut AgentSession,
     changed_paths: &[&Path],
+    recent_uploads: Option<&mut RecentUploads>,
 ) -> Result<bool> {
     // Convert absolute paths to relative paths and categorize
     let mut relative_paths: Vec<&std::path::Path> = Vec::new();
@@ -636,6 +669,13 @@ async fn sync_changed_paths(
         let transfers = prepare_cas_transfers(local, &all_paths, &local_snapshot)?;
         let delete_refs: Vec<&Path> = to_delete.iter().map(std::path::PathBuf::as_path).collect();
         transfer_files_cas(agent, &transfers, &delete_refs).await?;
+
+        // Record uploaded files for ChangeNotify filtering
+        if let Some(uploads) = recent_uploads {
+            for transfer in &transfers {
+                uploads.record(transfer.path.clone(), transfer.manifest.file_hash);
+            }
+        }
     }
 
     info!(
@@ -898,6 +938,9 @@ async fn watch_command(
     // Build ignore checker once - walks directory to find all non-ignored paths
     let ignore_checker = IgnoreChecker::new(local);
 
+    // Track recently uploaded files to filter self-triggered ChangeNotify
+    let mut recent_uploads = RecentUploads::new();
+
     progress::watch_mode();
 
     // Bidirectional watch loop:
@@ -936,7 +979,7 @@ async fn watch_command(
 
                 // Incremental sync local -> remote
                 let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
-                if let Err(e) = sync_changed_paths(local, &mut agent, &path_refs).await {
+                if let Err(e) = sync_changed_paths(local, &mut agent, &path_refs, Some(&mut recent_uploads)).await {
                     warn!("Sync failed: {e}, will retry on next change");
                 }
             }
@@ -944,13 +987,24 @@ async fn watch_command(
             // Check for remote changes via CHANGE_NOTIFY
             remote_result = agent.try_read_message(poll_timeout) => {
                 match remote_result {
-                    Ok(Some(zsync_core::Message::ChangeNotify)) => {
-                        info!("Remote files changed, syncing...");
-                        // For now, do a full sync from remote
-                        // TODO: implement proper remote -> local incremental sync
-                        if let Err(e) = sync_once(local, &mut agent, &all_includes, delete).await {
-                            warn!("Sync from remote failed: {e}");
+                    Ok(Some(zsync_core::Message::ChangeNotify { changes })) => {
+                        // Filter out files we just uploaded
+                        let external_changes: Vec<_> = changes
+                            .iter()
+                            .filter(|c| !recent_uploads.was_uploaded(&c.path, &c.content_hash))
+                            .collect();
+
+                        if external_changes.is_empty() {
+                            debug!("Ignoring ChangeNotify for self-uploaded files");
+                        } else {
+                            info!("Remote files changed: {} files", external_changes.len());
+                            // For now, do a full sync from remote
+                            // TODO: implement proper remote -> local incremental sync using external_changes
+                            if let Err(e) = sync_once(local, &mut agent, &all_includes, delete).await {
+                                warn!("Sync from remote failed: {e}");
+                            }
                         }
+                        recent_uploads.clear();
                     }
                     Ok(Some(other)) => {
                         debug!("Unexpected message from agent: {:?}", other);

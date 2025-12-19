@@ -79,6 +79,7 @@ impl RecentWrites {
 use zsync_core::{
     ChunkCache, ChunkStore, ContentHash, DeltaComputer, Message, ProtocolReader, ProtocolWriter,
     Snapshot,
+    protocol::{ChangeType, FileChange},
 };
 
 #[derive(Parser)]
@@ -129,6 +130,7 @@ fn main() -> Result<()> {
 }
 
 /// Run daemon with file watching for bidirectional sync
+#[allow(clippy::too_many_lines)]
 async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
     eprintln!(
         "zsync-agent daemon starting (watch mode), root: {}",
@@ -238,9 +240,34 @@ async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
                     eprintln!("  {:?}: {:?}", event.kind, event.paths);
                 }
 
-                // Send change notification to client
-                if write_tx.send(WriteCommand::ChangeNotify).is_err() {
-                    break;
+                // Build enriched file change list
+                let changes: Vec<FileChange> = events
+                    .iter()
+                    .flat_map(|e| &e.paths)
+                    .filter_map(|path| {
+                        let rel_path = path.strip_prefix(root).ok()?.to_path_buf();
+                        let (content_hash, change_type) = if path.exists() {
+                            let hash = ContentHash::from_file(path).ok()?;
+                            // We can't reliably distinguish created vs modified from notify events,
+                            // so we use Modified for all existing files
+                            (hash, ChangeType::Modified)
+                        } else {
+                            // File was deleted - use zeroed hash
+                            (ContentHash::from_raw([0u8; 32]), ChangeType::Deleted)
+                        };
+                        Some(FileChange {
+                            path: rel_path,
+                            content_hash,
+                            change_type,
+                        })
+                    })
+                    .collect();
+
+                if !changes.is_empty() {
+                    // Send change notification to client
+                    if write_tx.send(WriteCommand::ChangeNotify { changes }).is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -253,7 +280,7 @@ async fn run_daemon_watch(root: &PathBuf) -> Result<()> {
 /// Commands sent to the I/O thread
 enum WriteCommand {
     HandleMessage { msg: Message },
-    ChangeNotify,
+    ChangeNotify { changes: Vec<FileChange> },
 }
 
 /// I/O thread that owns stdin/stdout and handles protocol messages
@@ -335,8 +362,8 @@ fn run_io_thread(
                     break;
                 }
             }
-            WriteCommand::ChangeNotify => {
-                if let Err(e) = writer.send_change_notify() {
+            WriteCommand::ChangeNotify { changes } => {
+                if let Err(e) = writer.send_change_notify(&changes) {
                     eprintln!("Error sending change notify: {e}");
                 }
             }
@@ -631,7 +658,7 @@ fn handle_message<W: Write>(
         }
 
         // Bidirectional messages - agent shouldn't receive these
-        Message::ChangeNotify => {
+        Message::ChangeNotify { .. } => {
             writer.send_error("Agent received ChangeNotify (should only be sent by agent)")?;
             Ok(BatchResponse::Normal)
         }

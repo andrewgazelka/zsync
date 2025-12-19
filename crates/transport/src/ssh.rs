@@ -17,6 +17,7 @@ use bytes::Bytes;
 
 use crate::agent::AgentBundle;
 use crate::{AgentSessionTrait, BatchOperationResult, Platform};
+use zsync_core::protocol::{ChangeType, FileChange};
 use zsync_core::{ContentHash, FileManifest, Message, Snapshot, protocol};
 
 /// SSH transport for communicating with remote hosts
@@ -51,9 +52,9 @@ pub struct AgentSession {
     channel: russh::Channel<russh::client::Msg>,
     root: PathBuf,
     buffer: Vec<u8>,
-    /// Track if we received a ChangeNotify during a request/response
+    /// Buffer ChangeNotify messages received during a request/response
     /// that should be returned on the next try_read_message call.
-    pending_change_notify: bool,
+    pending_change_notify: Option<Vec<FileChange>>,
 }
 
 impl AgentSession {
@@ -169,7 +170,10 @@ impl AgentSession {
                 let hashes = decode_missing_chunks(&payload)?;
                 Ok(Message::MissingChunks { hashes })
             }
-            protocol::msg::CHANGE_NOTIFY => Ok(Message::ChangeNotify),
+            protocol::msg::CHANGE_NOTIFY => {
+                let changes = decode_change_notify(&payload)?;
+                Ok(Message::ChangeNotify { changes })
+            }
             _ => Err(color_eyre::eyre::eyre!("Unknown message type: {msg_type}")),
         }
     }
@@ -183,9 +187,9 @@ impl AgentSession {
         loop {
             let msg = self.read_message().await?;
             match msg {
-                Message::ChangeNotify => {
+                Message::ChangeNotify { changes } => {
                     tracing::debug!("buffering ChangeNotify received during request/response");
-                    self.pending_change_notify = true;
+                    self.pending_change_notify = Some(changes);
                     // Continue reading until we get the actual response
                 }
                 other => return Ok(other),
@@ -201,9 +205,8 @@ impl AgentSession {
         timeout: std::time::Duration,
     ) -> Result<Option<Message>> {
         // First check for pending ChangeNotify from a previous request/response
-        if self.pending_change_notify {
-            self.pending_change_notify = false;
-            return Ok(Some(Message::ChangeNotify));
+        if let Some(changes) = self.pending_change_notify.take() {
+            return Ok(Some(Message::ChangeNotify { changes }));
         }
 
         tokio::select! {
@@ -803,6 +806,50 @@ fn decode_missing_chunks(data: &[u8]) -> Result<Vec<ContentHash>> {
     Ok(hashes)
 }
 
+/// Decode change notify message from binary
+fn decode_change_notify(data: &[u8]) -> Result<Vec<FileChange>> {
+    use std::io::{Cursor, Read as _};
+
+    let mut cursor = Cursor::new(data);
+
+    // Count
+    let mut count_buf = [0u8; 4];
+    cursor.read_exact(&mut count_buf)?;
+    let count = u32::from_be_bytes(count_buf) as usize;
+
+    let mut changes = Vec::with_capacity(count);
+    for _ in 0..count {
+        // Path length
+        let mut path_len_buf = [0u8; 2];
+        cursor.read_exact(&mut path_len_buf)?;
+        let path_len = u16::from_be_bytes(path_len_buf) as usize;
+
+        // Path bytes
+        let mut path_buf = vec![0u8; path_len];
+        cursor.read_exact(&mut path_buf)?;
+        let path = PathBuf::from(String::from_utf8_lossy(&path_buf).to_string());
+
+        // Content hash
+        let mut hash_buf = [0u8; 32];
+        cursor.read_exact(&mut hash_buf)?;
+        let content_hash = ContentHash::from_raw(hash_buf);
+
+        // Change type
+        let mut type_buf = [0u8; 1];
+        cursor.read_exact(&mut type_buf)?;
+        let change_type = ChangeType::from_u8(type_buf[0])
+            .ok_or_else(|| color_eyre::eyre::eyre!("invalid change type: {}", type_buf[0]))?;
+
+        changes.push(FileChange {
+            path,
+            content_hash,
+            change_type,
+        });
+    }
+
+    Ok(changes)
+}
+
 /// Parsed SSH config for a specific host (naive parser)
 struct SshHostConfig {
     identity_agent: Option<PathBuf>,
@@ -1179,7 +1226,7 @@ impl SshTransport {
             channel,
             root: PathBuf::from(root),
             buffer: Vec::new(),
-            pending_change_notify: false,
+            pending_change_notify: None,
         })
     }
 
