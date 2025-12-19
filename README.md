@@ -3,17 +3,17 @@
 </p>
 
 <p align="center">
-  <strong>Bidirectional sync to GPU instances in seconds.</strong><br>
+  <strong>Bidirectional file sync over SSH.</strong><br>
   Zero remote dependencies. Native .gitignore. Content-addressed.
 </p>
 
 <p align="center">
-  <code>nix run github:andrewgazelka/zsync -- root@gpu-box</code>
+  <code>nix run github:andrewgazelka/zsync -- user@server</code>
 </p>
 
 ---
 
-Working on RunPod, Lambda Labs, or any remote GPU instance? Tired of:
+Tired of:
 
 - **rsync** re-uploading entire files for tiny changes
 - **mutagen** requiring a 50MB daemon and complex setup
@@ -37,7 +37,7 @@ cargo install --git https://github.com/andrewgazelka/zsync
 # Sync current directory to remote (auto-creates ~/zsync/<dir_name>)
 zsync root@server
 
-# Custom SSH port (common on GPU clouds)
+# Custom SSH port
 zsync root@server -p 22222
 zsync root@server:22222           # same thing
 
@@ -91,7 +91,7 @@ Optional `.zsync.toml` in your project:
 
 ```toml
 # Include files even if gitignored
-include = [".env", "weights/*.safetensors"]
+include = [".env", "config/*.local"]
 
 # Port forwarding (active in watch mode)
 [[forward]]
@@ -99,8 +99,8 @@ local = 8080
 remote = 8080
 
 [[forward]]
-local = 6006    # TensorBoard
-remote = 6006
+local = 5432
+remote = 5432
 ```
 
 ## Platforms
