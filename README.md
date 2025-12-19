@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <code>nix run github:andrewgazelka/zsync -- root@gpu-box:/workspace</code>
+  <code>nix run github:andrewgazelka/zsync -- root@gpu-box</code>
 </p>
 
 ---
@@ -34,17 +34,21 @@ cargo install --git https://github.com/andrewgazelka/zsync
 ## Usage
 
 ```bash
-# Sync current directory to remote
-zsync root@server:/workspace/project
+# Sync current directory to remote (auto-creates ~/zsync/<dir_name>)
+zsync root@server
 
 # Custom SSH port (common on GPU clouds)
-zsync root@server:22222:/workspace/project
+zsync root@server -p 22222
+zsync root@server:22222           # same thing
+
+# Explicit remote path
+zsync root@server:/workspace/project
 
 # Watch mode — continuous sync as you edit
-zsync root@server:/workspace/project --watch
+zsync root@server --watch
 
 # Delete remote files not present locally
-zsync root@server:/workspace/project --delete
+zsync root@server --delete
 ```
 
 ## Why zsync?

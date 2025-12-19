@@ -134,18 +134,24 @@ Features:
   • Fast             - BLAKE3 hashing, binary protocol
 
 Examples:
-  zsync root@host:/path              # Sync current dir to remote
-  zsync root@host:2222:/path         # With custom SSH port
-  zsync root@host:/path --watch      # Continuous sync
-  zsync root@host:/path --delete     # Delete remote files not in local
+  zsync root@host                    # Sync to ~/zsync/<local_dir>
+  zsync root@host -p 2222            # Custom SSH port
+  zsync root@host:2222               # Port via colon (same as -p)
+  zsync root@host:/workspace         # Explicit remote path
+  zsync root@host --watch            # Continuous sync
+  zsync root@host --delete           # Delete remote files not in local
 "#)]
 struct Cli {
-    /// Remote destination (user@host:/path or user@host:port:/path)
+    /// Remote destination (user@host, user@host:port, or user@host:/path)
     remote: String,
 
     /// Local directory path
     #[arg(default_value = ".")]
     local: PathBuf,
+
+    /// SSH port (can also use user@host:port syntax)
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -195,8 +201,14 @@ async fn main() -> Result<()> {
     // Keep the guard alive
     let _log_guard = session.guard;
 
+    // Canonicalize local path for consistent directory name extraction
+    let local = cli
+        .local
+        .canonicalize()
+        .unwrap_or_else(|_| cli.local.clone());
+
     // Parse remote destination (includes port if specified)
-    let remote = parse_remote(&cli.remote)?;
+    let remote = parse_remote(&cli.remote, cli.port, &local)?;
 
     if cli.watch {
         watch_command(&cli.local, &remote, cli.debounce, &cli.include, cli.delete).await?;
@@ -916,47 +928,68 @@ struct RemoteSpec {
     path: String,
 }
 
-/// Parse remote string like "user@host:/path" or "user@host:port:/path" into components
-fn parse_remote(remote: &str) -> Result<RemoteSpec> {
-    let at_pos = remote.find('@').ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "Invalid remote format, expected user@host:/path or user@host:port:/path"
-        )
-    })?;
+/// Parse remote string into components.
+///
+/// Formats:
+/// - `user@host` → port 22, path from local dir
+/// - `user@host:2222` → port 2222, path from local dir
+/// - `user@host:/path` → port 22, explicit path
+/// - `user@host:2222:/path` → port 2222, explicit path
+///
+/// The `port_override` takes precedence over port in the remote string.
+/// The `local_dir` is used to generate default path when none specified.
+fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> Result<RemoteSpec> {
+    let at_pos = remote
+        .find('@')
+        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid remote format, expected user@host"))?;
 
     let user = remote[..at_pos].to_string();
     let rest = &remote[at_pos + 1..];
 
-    // Find all colons - could be host:port:/path or host:/path
+    // Find all colons
     let colon_positions: Vec<usize> = rest.match_indices(':').map(|(i, _)| i).collect();
 
-    if colon_positions.is_empty() {
-        color_eyre::eyre::bail!(
-            "Invalid remote format, expected user@host:/path or user@host:port:/path"
-        );
-    }
-
-    let first_colon = colon_positions[0];
-    let host = rest[..first_colon].to_string();
-
-    let (port, path) = if colon_positions.len() >= 2 {
-        // Could be host:port:/path - check if first segment is numeric
-        let potential_port = &rest[first_colon + 1..colon_positions[1]];
-
-        if let Ok(port_num) = potential_port.parse::<u16>() {
-            // It's host:port:/path
-            let path = rest[colon_positions[1] + 1..].to_string();
-            (port_num, path)
-        } else {
-            // Not a port number, treat first colon as path separator (e.g., host:/path/with:colon)
-            let path = rest[first_colon + 1..].to_string();
-            (22, path)
-        }
+    let (host, parsed_port, parsed_path) = if colon_positions.is_empty() {
+        // Just user@host
+        (rest.to_string(), 22, None)
     } else {
-        // Only one colon: host:/path
-        let path = rest[first_colon + 1..].to_string();
-        (22, path)
+        let first_colon = colon_positions[0];
+        let host = rest[..first_colon].to_string();
+        let after_first_colon = &rest[first_colon + 1..];
+
+        if colon_positions.len() >= 2 {
+            // Could be host:port:/path - check if first segment is numeric
+            let potential_port = &rest[first_colon + 1..colon_positions[1]];
+
+            if let Ok(port_num) = potential_port.parse::<u16>() {
+                // It's host:port:/path
+                let path = rest[colon_positions[1] + 1..].to_string();
+                (host, port_num, Some(path))
+            } else {
+                // Not a port number, treat as host:/path/with:colon
+                (host, 22, Some(after_first_colon.to_string()))
+            }
+        } else {
+            // One colon: could be host:port or host:/path
+            // If it parses as u16, it's a port; otherwise it's a path
+            if let Ok(port_num) = after_first_colon.parse::<u16>() {
+                (host, port_num, None)
+            } else {
+                (host, 22, Some(after_first_colon.to_string()))
+            }
+        }
     };
+
+    // Port override from -p flag takes precedence
+    let port = port_override.unwrap_or(parsed_port);
+
+    // Default path: ~/zsync/<local_dir_name>
+    let path = parsed_path.unwrap_or_else(|| {
+        let dir_name = local_dir
+            .file_name()
+            .map_or_else(|| "sync".to_string(), |n| n.to_string_lossy().to_string());
+        format!("~/zsync/{dir_name}")
+    });
 
     Ok(RemoteSpec {
         user,
@@ -970,9 +1003,13 @@ fn parse_remote(remote: &str) -> Result<RemoteSpec> {
 mod tests {
     use super::*;
 
+    fn test_local() -> PathBuf {
+        PathBuf::from("/test/myproject")
+    }
+
     #[test]
     fn test_parse_remote() {
-        let remote = parse_remote("root@example.com:/home/user").unwrap();
+        let remote = parse_remote("root@example.com:/home/user", None, &test_local()).unwrap();
         assert_eq!(remote.user, "root");
         assert_eq!(remote.host, "example.com");
         assert_eq!(remote.port, 22);
@@ -981,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_with_port() {
-        let remote = parse_remote("root@example.com:2222:/home/user").unwrap();
+        let remote = parse_remote("root@example.com:2222:/home/user", None, &test_local()).unwrap();
         assert_eq!(remote.user, "root");
         assert_eq!(remote.host, "example.com");
         assert_eq!(remote.port, 2222);
@@ -990,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_relative_path() {
-        let remote = parse_remote("user@host:workspace/project").unwrap();
+        let remote = parse_remote("user@host:workspace/project", None, &test_local()).unwrap();
         assert_eq!(remote.user, "user");
         assert_eq!(remote.host, "host");
         assert_eq!(remote.port, 22);
@@ -999,10 +1036,37 @@ mod tests {
 
     #[test]
     fn test_parse_remote_relative_path_with_port() {
-        let remote = parse_remote("user@host:10249:workspace/project").unwrap();
+        let remote =
+            parse_remote("user@host:10249:workspace/project", None, &test_local()).unwrap();
         assert_eq!(remote.user, "user");
         assert_eq!(remote.host, "host");
         assert_eq!(remote.port, 10249);
         assert_eq!(remote.path, "workspace/project");
+    }
+
+    #[test]
+    fn test_parse_remote_no_path() {
+        let remote = parse_remote("root@example.com", None, &test_local()).unwrap();
+        assert_eq!(remote.user, "root");
+        assert_eq!(remote.host, "example.com");
+        assert_eq!(remote.port, 22);
+        assert_eq!(remote.path, "~/zsync/myproject");
+    }
+
+    #[test]
+    fn test_parse_remote_port_only() {
+        let remote = parse_remote("root@example.com:2222", None, &test_local()).unwrap();
+        assert_eq!(remote.user, "root");
+        assert_eq!(remote.host, "example.com");
+        assert_eq!(remote.port, 2222);
+        assert_eq!(remote.path, "~/zsync/myproject");
+    }
+
+    #[test]
+    fn test_parse_remote_port_override() {
+        // -p flag should override port in remote string
+        let remote = parse_remote("root@example.com:2222", Some(3333), &test_local()).unwrap();
+        assert_eq!(remote.port, 3333);
+        assert_eq!(remote.path, "~/zsync/myproject");
     }
 }
