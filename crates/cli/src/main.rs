@@ -1081,14 +1081,11 @@ struct RemoteSpec {
 }
 
 /// Load SSH config from ~/.ssh/config
-fn load_ssh_config() -> Option<ssh2_config::SshConfig> {
+fn load_ssh_config() -> Option<ssh_config::SSHConfig> {
     let home = dirs::home_dir()?;
     let config_path = home.join(".ssh/config");
-    let file = std::fs::File::open(&config_path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    ssh2_config::SshConfig::default()
-        .parse(&mut reader, ssh2_config::ParseRule::ALLOW_UNKNOWN_FIELDS)
-        .ok()
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    ssh_config::SSHConfig::parse_str(&content).ok()
 }
 
 /// Parse remote string into components.
@@ -1166,16 +1163,19 @@ fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> R
         // Extract user from SSH config, or default to current user
         let user = params
             .as_ref()
-            .and_then(|p| p.user.clone())
+            .and_then(|p| p.get("User").cloned())
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".to_string()));
 
         // Extract hostname (may differ from alias) and port from SSH config
         let host = params
             .as_ref()
-            .and_then(|p| p.host_name.clone())
+            .and_then(|p| p.get("HostName").cloned())
             .unwrap_or_else(|| host_alias.clone());
 
-        let parsed_port = params.as_ref().and_then(|p| p.port).unwrap_or(22);
+        let parsed_port = params
+            .as_ref()
+            .and_then(|p| p.get("Port").and_then(|s| s.parse().ok()))
+            .unwrap_or(22);
 
         (user, host, parsed_port, parsed_path)
     };

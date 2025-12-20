@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "vendor/ssh_config"]
 resolver = "3"
 
 [workspace.metadata.crane]
@@ -51,7 +51,7 @@ zstd = "0.13"
 # SSH
 russh = "0.50.0-beta.7"
 russh-keys = "0.50.0-beta.7"
-ssh2-config = "0.6"
+ssh_config = { path = "vendor/ssh_config" }
 
 # File watching
 notify = { version = "8", features = ["serde"] }

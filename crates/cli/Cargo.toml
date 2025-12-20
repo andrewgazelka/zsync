@@ -30,7 +30,7 @@ zsync-core = { path = "../core" }
 zsync-transport = { path = "../transport" }
 bytes.workspace = true
 uuid.workspace = true
-ssh2-config.workspace = true
+ssh_config.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "ssh_config"
+version = "0.1.0"
+authors = ["Afonso Bordado <afonsobordado@az8.co>"]
+edition = "2018"
+license = "MPL-2.0"
+description = """A small package to parse OpenBSD ssh_config config files
+
+The motivation for this crate is that libssh2 does not have a ssh_config
+parser, and there aren't any decent bindings to libssh.
+"""
+repository = "https://gitlab.com/INdek/ssh_config"
+homepage = "https://gitlab.com/INdek/ssh_config"
+keywords = ["ssh", "config", "ssh_config", "libssh", "libssh2"]
+readme = "README.md"
+
+
+
+[badges]
+gitlab = { repository = "https://gitlab.com/INdek/ssh_config" }
+
+
+
+[dependencies]

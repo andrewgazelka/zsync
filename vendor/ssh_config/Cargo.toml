@@ -1,0 +1,16 @@
+[package]
+edition = "2021"
+name = "ssh_config"
+version = "0.1.0"
+authors = ["Afonso Bordado <afonsobordado@az8.co>"]
+description = "A small package to parse OpenBSD ssh_config config files"
+license = "MPL-2.0"
+
+[dependencies]
+
+[lints.rust]
+# Disable all warnings to avoid issues with old code style
+warnings = "allow"
+
+[lints.clippy]
+all = "allow"
