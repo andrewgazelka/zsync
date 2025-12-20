@@ -1,0 +1,5 @@
+"""Crates directory BUILD file."""
+
+package(default_visibility = ["//visibility:public"])
+
+# This directory contains workspace crates as subdirectories

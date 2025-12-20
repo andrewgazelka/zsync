@@ -32,5 +32,9 @@ bytes.workspace = true
 uuid.workspace = true
 ssh_config.workspace = true
 
+[features]
+default = []
+bundled = []  # Enables embedded Linux agent binaries
+
 [lints]
 workspace = true

@@ -1,0 +1,44 @@
+"""BUILD file for zsync-core library."""
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+)
+
+rust_library(
+    name = "zsync-core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "zsync_core",
+    edition = "2024",
+    deps = [
+        "@crates//:blake3",
+        "@crates//:bytes",
+        "@crates//:color-eyre",
+        "@crates//:crc32fast",
+        "@crates//:fastcdc",
+        "@crates//:heed",
+        "@crates//:hex",
+        "@crates//:ignore",
+        "@crates//:rayon",
+        "@crates//:rkyv",
+        "@crates//:serde",
+        "@crates//:tokio",
+        "@crates//:toml",
+        "@crates//:tracing",
+        "@crates//:zstd",
+    ],
+)
+
+rust_test(
+    name = "zsync-core_test",
+    crate = ":zsync-core",
+    deps = [
+        "@crates//:tempfile",
+    ],
+)

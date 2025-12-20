@@ -1,0 +1,43 @@
+"""BUILD file for zsync-transport library."""
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+)
+
+rust_library(
+    name = "zsync-transport",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "zsync_transport",
+    edition = "2024",
+    proc_macro_deps = [
+        "@crates//:async-trait",
+    ],
+    deps = [
+        "//crates/core:zsync-core",
+        "@crates//:bytes",
+        "@crates//:color-eyre",
+        "@crates//:dirs",
+        "@crates//:russh",
+        "@crates//:tokio",
+        "@crates//:tracing",
+    ],
+)
+
+rust_test(
+    name = "zsync-transport_test",
+    crate = ":zsync-transport",
+    deps = [
+        "@crates//:filetime",
+        "@crates//:rstest",
+        "@crates//:tempfile",
+        "@crates//:testcontainers",
+        "@crates//:tracing-subscriber",
+    ],
+)

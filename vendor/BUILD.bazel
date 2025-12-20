@@ -1,0 +1,5 @@
+"""Vendor directory BUILD file."""
+
+package(default_visibility = ["//visibility:public"])
+
+# This directory contains vendored crates as subdirectories

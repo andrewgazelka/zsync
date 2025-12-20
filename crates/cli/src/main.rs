@@ -8,6 +8,7 @@
 //! - File watching with debouncing
 
 mod debug_log;
+#[cfg_attr(feature = "bundled", path = "../bundled_src/embedded_agents.rs")]
 mod embedded_agents;
 mod progress;
 
@@ -1103,6 +1104,9 @@ fn load_ssh_config() -> Option<ssh_config::SSHConfig> {
 /// The `local_dir` is used to generate default path when none specified.
 fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> RemoteSpec {
     // Check if there's an @ symbol (explicit user@host format)
+    // Load SSH config once for lookups
+    let ssh_config = load_ssh_config();
+
     let (user, host, parsed_port, parsed_path) = if let Some(at_pos) = remote.find('@') {
         // Explicit user@host format
         let user = remote[..at_pos].to_string();
@@ -1111,9 +1115,9 @@ fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> R
         // Find all colons
         let colon_positions: Vec<usize> = rest.match_indices(':').map(|(i, _)| i).collect();
 
-        let (host, parsed_port, parsed_path) = if colon_positions.is_empty() {
+        let (host_alias, parsed_port, parsed_path) = if colon_positions.is_empty() {
             // Just user@host
-            (rest.to_string(), 22, None)
+            (rest.to_string(), None, None)
         } else {
             let first_colon = colon_positions[0];
             let host = rest[..first_colon].to_string();
@@ -1126,21 +1130,37 @@ fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> R
                 if let Ok(port_num) = potential_port.parse::<u16>() {
                     // It's host:port:/path
                     let path = rest[colon_positions[1] + 1..].to_string();
-                    (host, port_num, Some(path))
+                    (host, Some(port_num), Some(path))
                 } else {
                     // Not a port number, treat as host:/path/with:colon
-                    (host, 22, Some(after_first_colon.to_string()))
+                    (host, None, Some(after_first_colon.to_string()))
                 }
             } else {
                 // One colon: could be host:port or host:/path
                 // If it parses as u16, it's a port; otherwise it's a path
                 if let Ok(port_num) = after_first_colon.parse::<u16>() {
-                    (host, port_num, None)
+                    (host, Some(port_num), None)
                 } else {
-                    (host, 22, Some(after_first_colon.to_string()))
+                    (host, None, Some(after_first_colon.to_string()))
                 }
             }
         };
+
+        // Resolve host alias to actual hostname via SSH config
+        let params = ssh_config.as_ref().map(|cfg| cfg.query(&host_alias));
+        let host = params
+            .as_ref()
+            .and_then(|p| p.get("HostName").cloned())
+            .unwrap_or(host_alias);
+
+        // Use explicit port if provided, otherwise check SSH config, otherwise default to 22
+        let parsed_port = parsed_port
+            .or_else(|| {
+                params
+                    .as_ref()
+                    .and_then(|p| p.get("Port").and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(22);
 
         (user, host, parsed_port, parsed_path)
     } else {
@@ -1157,7 +1177,6 @@ fn parse_remote(remote: &str, port_override: Option<u16>, local_dir: &Path) -> R
         };
 
         // Look up host in SSH config
-        let ssh_config = load_ssh_config();
         let params = ssh_config.as_ref().map(|cfg| cfg.query(&host_alias));
 
         // Extract user from SSH config, or default to current user

@@ -1,0 +1,116 @@
+"""BUILD file for zsync CLI binary."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("//build:multi_arch.bzl", "build_linux_agents", "embedded_agents")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "build.rs",
+])
+
+# ============================================================================
+# Standard CLI binary (without embedded agents)
+# ============================================================================
+
+genrule(
+    name = "embedded_agents_empty_gen",
+    outs = ["src/embedded_agents.rs"],
+    cmd = """
+cat > $@ << 'EOF'
+//! Embedded agent binaries (empty - no agents bundled)
+
+use zsync_transport::AgentBundle;
+
+pub fn embedded_bundle() -> AgentBundle {
+    AgentBundle::new()
+}
+EOF
+""",
+)
+
+rust_binary(
+    name = "zsync",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/embedded_agents.rs"],
+    ) + [":embedded_agents_empty_gen"],
+    crate_name = "zsync",
+    edition = "2024",
+    deps = [
+        "//crates/core:zsync-core",
+        "//crates/transport:zsync-transport",
+        "//vendor/ssh_config",
+        "@crates//:bytes",
+        "@crates//:clap",
+        "@crates//:color-eyre",
+        "@crates//:console",
+        "@crates//:dirs",
+        "@crates//:humansize",
+        "@crates//:ignore",
+        "@crates//:notify",
+        "@crates//:notify-debouncer-full",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-appender",
+        "@crates//:tracing-subscriber",
+        "@crates//:uuid",
+        "@crates//:zstd",
+    ],
+)
+
+# ============================================================================
+# Bundled CLI binary with embedded Linux agents
+# ============================================================================
+# Single command: bazel build //crates/cli:zsync-bundled
+# This builds Linux agents in a container, then embeds them in the macOS CLI.
+
+build_linux_agents(
+    name = "linux_agents",
+)
+
+embedded_agents(
+    name = "embedded_agents_bundled_src",
+    agents = ":linux_agents",
+)
+
+rust_binary(
+    name = "zsync-bundled",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/embedded_agents.rs"],
+    ) + [":embedded_agents_bundled_src"],
+    crate_features = ["bundled"],
+    crate_name = "zsync",
+    edition = "2024",
+    deps = [
+        "//crates/core:zsync-core",
+        "//crates/transport:zsync-transport",
+        "//vendor/ssh_config",
+        "@crates//:bytes",
+        "@crates//:clap",
+        "@crates//:color-eyre",
+        "@crates//:console",
+        "@crates//:dirs",
+        "@crates//:humansize",
+        "@crates//:ignore",
+        "@crates//:notify",
+        "@crates//:notify-debouncer-full",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-appender",
+        "@crates//:tracing-subscriber",
+        "@crates//:uuid",
+        "@crates//:zstd",
+    ],
+)
+
+rust_test(
+    name = "zsync_test",
+    crate = ":zsync",
+)

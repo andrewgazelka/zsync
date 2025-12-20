@@ -4,3 +4,7 @@
 *.swp
 *.swo
 .DS_Store
+
+# Bazel
+/bazel-*
+MODULE.bazel.lock

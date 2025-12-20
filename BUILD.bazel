@@ -1,0 +1,28 @@
+"""Root BUILD file for zsync workspace."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Export Cargo files for crate_universe
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+    "Cargo.bazel.toml",
+])
+
+# Aliases for main targets
+alias(
+    name = "zsync",
+    actual = "//crates/cli:zsync",
+)
+
+alias(
+    name = "zsync-agent",
+    actual = "//crates/agent:zsync-agent",
+)
+
+alias(
+    name = "zsync-bundled",
+    actual = "//crates/cli:zsync-bundled",
+)

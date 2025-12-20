@@ -1,0 +1,38 @@
+# Bazel configuration for zsync
+
+# Use bzlmod (Bazel modules)
+common --enable_bzlmod
+
+# Rust-specific settings
+build --@rules_rust//rust/toolchain/channel=stable
+
+# Optimized release build
+build:release --compilation_mode=opt
+build:release -c opt
+
+# Debug build with symbols
+build:debug --compilation_mode=dbg
+build:debug -c dbg
+
+# Fast incremental builds during development
+build:dev --compilation_mode=fastbuild
+build:dev -c fastbuild
+
+# CI configuration
+build:ci --compilation_mode=opt
+build:ci --verbose_failures
+build:ci --keep_going
+
+# Parallel execution
+build --jobs=auto
+
+# Better error messages
+build --verbose_failures
+build --show_timestamps
+
+# Cache options
+build --disk_cache=~/.cache/bazel
+
+# Test configuration
+test --test_output=errors
+test --test_verbose_timeout_warnings

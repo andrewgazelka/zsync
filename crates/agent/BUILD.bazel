@@ -1,0 +1,32 @@
+"""BUILD file for zsync-agent binary."""
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+filegroup(
+    name = "srcs",
+    srcs = glob(["**"]),
+)
+
+rust_binary(
+    name = "zsync-agent",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "zsync_agent",
+    edition = "2024",
+    deps = [
+        "//crates/core:zsync-core",
+        "@crates//:clap",
+        "@crates//:color-eyre",
+        "@crates//:ignore",
+        "@crates//:notify",
+        "@crates//:notify-debouncer-full",
+        "@crates//:rayon",
+        "@crates//:serde",
+        "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+    ],
+)

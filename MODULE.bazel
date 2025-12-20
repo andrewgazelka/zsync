@@ -1,0 +1,50 @@
+"""Bazel module for zsync - Fast, modern file synchronization."""
+
+module(
+    name = "zsync",
+    version = "0.1.0",
+)
+
+# Bazel Skylib for common utilities
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+
+# rules_rust for Rust compilation
+bazel_dep(name = "rules_rust", version = "0.68.1")
+
+# Platforms
+bazel_dep(name = "platforms", version = "0.0.10")
+
+# =============================================================================
+# Rust Toolchain
+# =============================================================================
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.85.0"],
+)
+
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# =============================================================================
+# Crate Dependencies
+# =============================================================================
+
+crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.bazel.toml"],
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+
+use_repo(crate, "crates")
